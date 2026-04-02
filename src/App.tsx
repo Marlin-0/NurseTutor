@@ -63,10 +63,15 @@ const QUICK_ACTIONS = [
   { label: "Case scenario", prompt: "Give me a clinical nursing case scenario" },
 ];
 
-function buildSystemPrompt(doc: UploadedDoc | null, customInstructions?: string): string {
-  const docContent = doc?.content ? doc.content.slice(0, 12000) : "";
-  const docContext = doc
-    ? `\n\nThe student has uploaded study material titled "${doc.name}". Use this as the PRIMARY source when generating questions and explanations — pull directly from this content when possible:\n\n---\n${docContent}\n---\n`
+function buildSystemPrompt(docs: UploadedDoc[], customInstructions?: string): string {
+  const TOTAL_CHAR_BUDGET = 3000;
+  const docsWithContent = docs.filter(d => d.content);
+  const charsEach = docsWithContent.length > 0
+    ? Math.floor(TOTAL_CHAR_BUDGET / docsWithContent.length)
+    : TOTAL_CHAR_BUDGET;
+  const docContext = docs.length > 0
+    ? `\n\nThe student has uploaded the following study materials. Use these as the PRIMARY source when generating questions and explanations — pull directly from this content when possible:\n\n` +
+      docs.map(d => `--- ${d.name} ---\n${d.content ? d.content.slice(0, charsEach) : "(PDF — use filename for context)"}`).join("\n\n") + "\n"
     : "";
   const customContext = customInstructions?.trim()
     ? `\n\n━━━ CUSTOM INSTRUCTIONS FROM STUDENT ━━━\n${customInstructions.trim()}\nAlways follow the above instructions for every response.\n`
@@ -122,11 +127,16 @@ For all non-quiz requests: explain clearly, use bullet points for lists, and kee
 
 // ─── API ──────────────────────────────────────────────────────────────────────
 
+interface GroqResponse {
+  content: string;
+  usage: { prompt_tokens: number; completion_tokens: number; total_tokens: number };
+}
+
 async function callGroq(
   history: ConversationTurn[],
-  doc: UploadedDoc | null,
+  docs: UploadedDoc[],
   customInstructions?: string
-): Promise<string> {
+): Promise<GroqResponse> {
   const apiKey = import.meta.env.VITE_GROQ_API_KEY as string;
 
   const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
@@ -137,16 +147,19 @@ async function callGroq(
     },
     body: JSON.stringify({
       model: "llama-3.1-8b-instant",
-      max_tokens: 4096,
+      max_tokens: 1500,
       messages: [
-        { role: "system", content: buildSystemPrompt(doc, customInstructions) },
+        { role: "system", content: buildSystemPrompt(docs, customInstructions) },
         ...history.slice(-2).map((turn) => ({ role: turn.role, content: turn.content.slice(0, 2000) })),
       ],
     }),
   });
   if (!res.ok) throw new Error(`API error ${res.status}`);
   const data = await res.json();
-  return data.choices[0].message.content as string;
+  return {
+    content: data.choices[0].message.content as string,
+    usage: data.usage,
+  };
 }
 
 // ─── Parsers ──────────────────────────────────────────────────────────────────
@@ -580,7 +593,9 @@ function StudentTutor({ onBack }: { onBack: () => void }) {
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const [score, setScore] = useState({ correct: 0, total: 0 });
-  const [uploadedDoc, setUploadedDoc] = useState<UploadedDoc | null>(null);
+  const [tokenUsage, setTokenUsage] = useState({ last: 0, session: 0 });
+  const [uploadedDocs, setUploadedDocs] = useState<UploadedDoc[]>([]);
+  const [showFiles, setShowFiles] = useState(false);
   const [history, setHistory] = useState<ConversationTurn[]>([]);
   const [customInstructions, setCustomInstructions] = useState<string>(
     () => localStorage.getItem("nursetutor-instructions") ?? ""
@@ -638,7 +653,8 @@ function StudentTutor({ onBack }: { onBack: () => void }) {
       setLoading(true);
 
       try {
-        const raw = await callGroq(newHistory, uploadedDoc, customInstructions);
+        const { content: raw, usage } = await callGroq(newHistory, uploadedDocs, customInstructions);
+        setTokenUsage(prev => ({ last: usage.total_tokens, session: prev.session + usage.total_tokens }));
         setHistory((h) => [...h, { role: "assistant", content: raw }]);
 
         const batch = parseBatch(raw);
@@ -667,7 +683,7 @@ function StudentTutor({ onBack }: { onBack: () => void }) {
         setLoading(false);
       }
     },
-    [loading, history, uploadedDoc, customInstructions]
+    [loading, history, uploadedDocs, customInstructions]
   );
 
   const answerMCQ = useCallback(
@@ -720,30 +736,36 @@ function StudentTutor({ onBack }: { onBack: () => void }) {
 
   const handleFileUpload = useCallback(
     async (e: React.ChangeEvent<HTMLInputElement>) => {
-      const file = e.target.files?.[0];
-      if (!file) return;
+      const files = Array.from(e.target.files ?? []);
+      if (files.length === 0) return;
       e.target.value = "";
 
-      const isPdf = file.name.toLowerCase().endsWith(".pdf");
-
-      if (isPdf) {
-        setUploadedDoc({ name: file.name, content: "", isPdf: true });
-        setHistory([]);
-        setMessages((prev) => [...prev, { id: uid(), role: "assistant", type: "text",
-          content: `Got it — I've loaded ${file.name}. I'll now base my questions and explanations on your material. Want me to quiz you on it, explain a concept, or work through a case?` }]);
-        return;
+      const added: UploadedDoc[] = [];
+      for (const file of files) {
+        const isPdf = file.name.toLowerCase().endsWith(".pdf");
+        if (isPdf) {
+          added.push({ name: file.name, content: "", isPdf: true });
+        } else {
+          try {
+            const content = await extractText(file);
+            added.push({ name: file.name, content });
+          } catch {
+            setMessages((prev) => [...prev, { id: uid(), role: "assistant", type: "text",
+              content: `Sorry, I couldn't read ${file.name}. Try .txt, .md, .docx, or .pptx.` }]);
+          }
+        }
       }
 
-      try {
-        const content = await extractText(file);
-        setUploadedDoc({ name: file.name, content });
-        setHistory([]);
-        setMessages((prev) => [...prev, { id: uid(), role: "assistant", type: "text",
-          content: `Got it — I've loaded ${file.name}. I'll now base my questions and explanations on your material. Want me to quiz you on it, explain a concept, or work through a case?` }]);
-      } catch {
-        setMessages((prev) => [...prev, { id: uid(), role: "assistant", type: "text",
-          content: `Sorry, I couldn't read that file. Please try a .txt, .md, .docx, or .pptx file.` }]);
-      }
+      if (added.length === 0) return;
+
+      setUploadedDocs((prev) => {
+        const names = new Set(prev.map(d => d.name));
+        return [...prev, ...added.filter(d => !names.has(d.name))];
+      });
+
+      const names = added.map(d => d.name).join(", ");
+      setMessages((prev) => [...prev, { id: uid(), role: "assistant", type: "text",
+        content: `Got it — I've added ${names} to your file bank. I'll draw on all your uploaded files when generating questions. Want me to quiz you, explain a concept, or work through a case?` }]);
     },
     []
   );
@@ -761,6 +783,28 @@ function StudentTutor({ onBack }: { onBack: () => void }) {
         </div>
         <div className="ml-auto flex items-center gap-3">
           <ScoreBadge correct={score.correct} total={score.total} />
+          {tokenUsage.last > 0 && (
+            <div className="flex flex-col items-end gap-0.5" title="Groq token usage (free tier: 6,000 TPM)">
+              <div className="flex items-center gap-1">
+                <span className="text-[10px] text-muted-foreground">Last</span>
+                <span className={cn(
+                  "text-[10px] font-semibold",
+                  tokenUsage.last > 5000 ? "text-red-500" : tokenUsage.last > 3500 ? "text-amber-500" : "text-emerald-600"
+                )}>{tokenUsage.last.toLocaleString()}</span>
+                <span className="text-[10px] text-muted-foreground">/ 6k</span>
+              </div>
+              <div className="w-16 h-1 rounded-full bg-muted overflow-hidden">
+                <div
+                  className={cn(
+                    "h-full rounded-full transition-all",
+                    tokenUsage.last > 5000 ? "bg-red-500" : tokenUsage.last > 3500 ? "bg-amber-400" : "bg-emerald-500"
+                  )}
+                  style={{ width: `${Math.min(100, (tokenUsage.last / 6000) * 100)}%` }}
+                />
+              </div>
+              <span className="text-[10px] text-muted-foreground">Session: {tokenUsage.session.toLocaleString()}</span>
+            </div>
+          )}
           <button
             onClick={onBack}
             className="shrink-0 text-xs text-muted-foreground hover:text-foreground border border-border rounded-lg px-2.5 h-8 transition-all hover:border-brand-400"
@@ -768,15 +812,18 @@ function StudentTutor({ onBack }: { onBack: () => void }) {
           >
             ← Home
           </button>
-          {uploadedDoc && (
-            <Badge
-              variant="secondary"
-              className="text-xs max-w-[140px] truncate cursor-pointer"
-              onClick={() => { setUploadedDoc(null); setHistory([]); }}
-              title="Click to remove document"
+          {uploadedDocs.length > 0 && (
+            <button
+              onClick={() => setShowFiles(v => !v)}
+              className={cn(
+                "shrink-0 flex items-center gap-1.5 px-2.5 h-8 rounded-lg border text-xs font-medium transition-all",
+                showFiles
+                  ? "border-brand-500 bg-brand-50 text-brand-600"
+                  : "border-border text-muted-foreground hover:border-brand-400 hover:text-brand-600"
+              )}
             >
-              📄 {uploadedDoc.name}
-            </Badge>
+              📁 {uploadedDocs.length} file{uploadedDocs.length !== 1 ? "s" : ""}
+            </button>
           )}
           <button
             onClick={() => { setDraftInstructions(customInstructions); setShowInstructions(v => !v); }}
@@ -795,6 +842,35 @@ function StudentTutor({ onBack }: { onBack: () => void }) {
           </button>
         </div>
       </div>
+
+      {/* ── File bank panel ── */}
+      {showFiles && (
+        <div className="shrink-0 border-b border-border bg-muted/30 px-5 py-3 space-y-2">
+          <div className="flex items-center justify-between">
+            <p className="text-xs font-semibold text-foreground">Uploaded files</p>
+            <button
+              onClick={() => setUploadedDocs([])}
+              className="text-xs text-red-500 hover:text-red-600 transition-colors"
+            >
+              Remove all
+            </button>
+          </div>
+          <div className="space-y-1.5">
+            {[...uploadedDocs].sort((a, b) => a.name.localeCompare(b.name)).map(doc => (
+              <div key={doc.name} className="flex items-center gap-2 text-xs bg-background border border-border rounded-lg px-3 py-2">
+                <span className="text-base">📄</span>
+                <span className="flex-1 truncate text-foreground font-medium">{doc.name}</span>
+                <button
+                  onClick={() => setUploadedDocs(prev => prev.filter(d => d.name !== doc.name))}
+                  className="text-muted-foreground hover:text-red-500 transition-colors"
+                >
+                  ✕
+                </button>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       {/* ── Custom instructions panel ── */}
       {showInstructions && (
@@ -945,6 +1021,7 @@ function StudentTutor({ onBack }: { onBack: () => void }) {
           ref={fileInputRef}
           type="file"
           accept=".txt,.md,.csv,.rtf,.pdf,.docx,.pptx"
+          multiple
           className="hidden"
           onChange={handleFileUpload}
         />
@@ -953,7 +1030,7 @@ function StudentTutor({ onBack }: { onBack: () => void }) {
           title="Upload study notes (.txt, .md, .pdf)"
           className={cn(
             "shrink-0 w-9 h-9 rounded-lg border flex items-center justify-center transition-all",
-            uploadedDoc
+            uploadedDocs.length > 0
               ? "border-brand-500 bg-brand-50 text-brand-600 dark:bg-brand-950/30"
               : "border-border text-muted-foreground hover:border-brand-400 hover:text-brand-600"
           )}
@@ -979,8 +1056,8 @@ function StudentTutor({ onBack }: { onBack: () => void }) {
             }
           }}
           placeholder={
-            uploadedDoc
-              ? `Ask about ${uploadedDoc.name}…`
+            uploadedDocs.length > 0
+              ? `Ask about your ${uploadedDocs.length} uploaded file${uploadedDocs.length !== 1 ? "s" : ""}…`
               : "Ask a question or request a quiz…"
           }
           disabled={loading}
