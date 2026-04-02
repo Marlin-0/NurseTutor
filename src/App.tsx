@@ -5,6 +5,7 @@ import { Input } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { cn } from "@/lib/utils";
 import TeacherDashboard from "./TeacherDashboard";
+import { extractText } from "./lib/parseFile";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -116,10 +117,7 @@ When the student asks for more than one question (e.g. "give me 5 MCQs", "3 SATA
 Output ONLY the questions separated by ---. No preamble, no numbering, no summary text.
 
 ━━━ TUTOR MODE ━━━
-For all non-quiz requests: explain clearly, use bullet points for lists, and keep answers clinically relevant and NCLEX-focused. Be encouraging, concise, and precise.
-
-━━━ SCOPE GUARD ━━━
-You are a nursing tutor ONLY. If the student's message is not related to nursing, healthcare, or clinical practice, do not answer it. Instead, reply with exactly one short sentence redirecting them — e.g. "Let's keep our focus on nursing — what topic or question can I help you with?" Never explain why you can't help with other topics, just redirect warmly.`;
+For all non-quiz requests: explain clearly, use bullet points for lists, and keep answers clinically relevant and NCLEX-focused. Be encouraging, concise, and precise.`;
 }
 
 // ─── API ──────────────────────────────────────────────────────────────────────
@@ -721,38 +719,31 @@ function StudentTutor({ onBack }: { onBack: () => void }) {
   }, []);
 
   const handleFileUpload = useCallback(
-    (e: React.ChangeEvent<HTMLInputElement>) => {
+    async (e: React.ChangeEvent<HTMLInputElement>) => {
       const file = e.target.files?.[0];
       if (!file) return;
+      e.target.value = "";
 
-      const isPdf = file.type === "application/pdf" || file.name.endsWith(".pdf");
-
-      const finalize = (doc: UploadedDoc) => {
-        setUploadedDoc(doc);
-        setHistory([]);
-        setMessages((prev) => [
-          ...prev,
-          {
-            id: uid(),
-            role: "assistant",
-            type: "text",
-            content: `Got it — I've loaded **${file.name}**. I'll now base my questions and explanations on your material. Want me to quiz you on it, explain a concept, or work through a case?`,
-          },
-        ]);
-      };
+      const isPdf = file.name.toLowerCase().endsWith(".pdf");
 
       if (isPdf) {
-        finalize({ name: file.name, content: "", isPdf: true });
-      } else {
-        const reader = new FileReader();
-        reader.onload = (ev) => {
-          const content = ev.target?.result as string;
-          finalize({ name: file.name, content });
-        };
-        reader.readAsText(file);
+        setUploadedDoc({ name: file.name, content: "", isPdf: true });
+        setHistory([]);
+        setMessages((prev) => [...prev, { id: uid(), role: "assistant", type: "text",
+          content: `Got it — I've loaded ${file.name}. I'll now base my questions and explanations on your material. Want me to quiz you on it, explain a concept, or work through a case?` }]);
+        return;
       }
 
-      e.target.value = "";
+      try {
+        const content = await extractText(file);
+        setUploadedDoc({ name: file.name, content });
+        setHistory([]);
+        setMessages((prev) => [...prev, { id: uid(), role: "assistant", type: "text",
+          content: `Got it — I've loaded ${file.name}. I'll now base my questions and explanations on your material. Want me to quiz you on it, explain a concept, or work through a case?` }]);
+      } catch {
+        setMessages((prev) => [...prev, { id: uid(), role: "assistant", type: "text",
+          content: `Sorry, I couldn't read that file. Please try a .txt, .md, .docx, or .pptx file.` }]);
+      }
     },
     []
   );
@@ -953,7 +944,7 @@ function StudentTutor({ onBack }: { onBack: () => void }) {
         <input
           ref={fileInputRef}
           type="file"
-          accept=".txt,.md,.csv,.rtf,.pdf"
+          accept=".txt,.md,.csv,.rtf,.pdf,.docx,.pptx"
           className="hidden"
           onChange={handleFileUpload}
         />

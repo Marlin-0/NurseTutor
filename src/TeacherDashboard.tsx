@@ -1,4 +1,5 @@
 import React, { useState, useRef } from "react";
+import { extractText } from "./lib/parseFile";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { cn } from "@/lib/utils";
@@ -301,31 +302,28 @@ export default function TeacherDashboard({ onBack }: { onBack: () => void }) {
     setActiveTabId("week-1");
   }
 
-  function handleFileUpload(e: React.ChangeEvent<HTMLInputElement>) {
+  async function handleFileUpload(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
     if (!file) return;
-    const isPdf = file.type === "application/pdf" || file.name.endsWith(".pdf");
+    e.target.value = "";
+
+    const isPdf = file.name.toLowerCase().endsWith(".pdf");
 
     if (isPdf) {
       updateTab(activeTabId, {
-        files: [
-          ...activeTab.files,
-          { name: file.name, content: `[PDF: ${file.name}]` },
-        ],
+        files: [...activeTab.files, { name: file.name, content: `[PDF: ${file.name}]` }],
       });
-    } else {
-      const reader = new FileReader();
-      reader.onload = (ev) => {
-        updateTab(activeTabId, {
-          files: [
-            ...activeTab.files,
-            { name: file.name, content: ev.target?.result as string },
-          ],
-        });
-      };
-      reader.readAsText(file);
+      return;
     }
-    e.target.value = "";
+
+    try {
+      const content = await extractText(file);
+      updateTab(activeTabId, {
+        files: [...activeTab.files, { name: file.name, content }],
+      });
+    } catch {
+      updateTab(activeTabId, { error: `Could not read ${file.name}. Try .txt, .md, .docx, or .pptx.` });
+    }
   }
 
   function removeFile(fileName: string) {
@@ -477,13 +475,13 @@ export default function TeacherDashboard({ onBack }: { onBack: () => void }) {
                 Click to upload files
               </p>
               <p className="text-xs text-muted-foreground mt-1">
-                .txt, .md, or .pdf — upload multiple files for this week
+                .txt, .md, .pdf, .docx, or .pptx — upload multiple files for this week
               </p>
             </div>
             <input
               ref={fileInputRef}
               type="file"
-              accept=".txt,.md,.pdf"
+              accept=".txt,.md,.pdf,.docx,.pptx"
               className="hidden"
               onChange={handleFileUpload}
             />
