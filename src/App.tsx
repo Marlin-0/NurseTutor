@@ -4,6 +4,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { cn } from "@/lib/utils";
+import TeacherDashboard from "./TeacherDashboard";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -48,9 +49,8 @@ interface ConversationTurn {
 
 interface UploadedDoc {
   name: string;
-  content: string;       // plain text (for .txt/.md etc.)
+  content: string;
   isPdf?: boolean;
-  pdfBase64?: string;    // base64-encoded PDF bytes
 }
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -466,9 +466,77 @@ function ScoreBadge({ correct, total }: { correct: number; total: number }) {
   );
 }
 
-// ─── Main App ─────────────────────────────────────────────────────────────────
+// ─── Landing Screen ───────────────────────────────────────────────────────────
+
+function LandingScreen({ onSelect }: { onSelect: (role: "student" | "teacher") => void }) {
+  return (
+    <div className="flex flex-col h-screen bg-background font-sans items-center justify-center px-6">
+      <div className="flex flex-col items-center gap-2 mb-10">
+        <div className="w-16 h-16 rounded-full overflow-hidden mb-2">
+          <img src="/nurse-avatar.png" alt="NurseTutor" className="w-full h-full object-cover" />
+        </div>
+        <h1 className="text-2xl font-bold tracking-tight text-foreground">NurseTutor</h1>
+        <p className="text-sm text-muted-foreground">NCLEX-focused clinical learning platform</p>
+      </div>
+
+      <p className="text-sm font-medium text-foreground mb-5">How are you using NurseTutor today?</p>
+
+      <div className="flex flex-col sm:flex-row gap-4 w-full max-w-md">
+        {/* Student card */}
+        <button
+          onClick={() => onSelect("student")}
+          className="flex-1 group rounded-2xl border-2 border-border bg-card hover:border-brand-400 hover:bg-brand-50/40 transition-all p-6 text-left space-y-3"
+        >
+          <div className="w-11 h-11 rounded-xl bg-brand-100 flex items-center justify-center text-2xl">
+            🎓
+          </div>
+          <div>
+            <p className="font-semibold text-sm text-foreground group-hover:text-brand-700">I'm a Student</p>
+            <p className="text-xs text-muted-foreground mt-0.5 leading-relaxed">
+              Practice with MCQ &amp; SATA questions, upload your notes, and get instant explanations.
+            </p>
+          </div>
+          <span className="inline-block text-xs font-semibold text-brand-600 group-hover:translate-x-0.5 transition-transform">
+            Start studying →
+          </span>
+        </button>
+
+        {/* Teacher card */}
+        <button
+          onClick={() => onSelect("teacher")}
+          className="flex-1 group rounded-2xl border-2 border-border bg-card hover:border-brand-400 hover:bg-brand-50/40 transition-all p-6 text-left space-y-3"
+        >
+          <div className="w-11 h-11 rounded-xl bg-brand-100 flex items-center justify-center text-2xl">
+            📋
+          </div>
+          <div>
+            <p className="font-semibold text-sm text-foreground group-hover:text-brand-700">I'm a Teacher</p>
+            <p className="text-xs text-muted-foreground mt-0.5 leading-relaxed">
+              Build weekly question banks from your course material and export them for exams.
+            </p>
+          </div>
+          <span className="inline-block text-xs font-semibold text-brand-600 group-hover:translate-x-0.5 transition-transform">
+            Open dashboard →
+          </span>
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ─── Root ─────────────────────────────────────────────────────────────────────
 
 export default function App() {
+  const [view, setView] = useState<"landing" | "student" | "teacher">("landing");
+
+  if (view === "landing") return <LandingScreen onSelect={setView} />;
+  if (view === "teacher") return <TeacherDashboard onBack={() => setView("landing")} />;
+  return <StudentTutor onBack={() => setView("landing")} />;
+}
+
+// ─── Student Tutor ────────────────────────────────────────────────────────────
+
+function StudentTutor({ onBack }: { onBack: () => void }) {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
@@ -636,13 +704,7 @@ export default function App() {
       };
 
       if (isPdf) {
-        const reader = new FileReader();
-        reader.onload = (ev) => {
-          const dataUrl = ev.target?.result as string;
-          const base64 = dataUrl.split(",")[1];
-          finalize({ name: file.name, content: "", isPdf: true, pdfBase64: base64 });
-        };
-        reader.readAsDataURL(file);
+        finalize({ name: file.name, content: "", isPdf: true });
       } else {
         const reader = new FileReader();
         reader.onload = (ev) => {
@@ -666,12 +728,17 @@ export default function App() {
         </div>
         <div>
           <h1 className="text-sm font-semibold tracking-tight">NurseTutor</h1>
-          <p className="text-xs text-muted-foreground">
-            NCLEX-focused clinical tutor
-          </p>
+          <p className="text-xs text-muted-foreground">NCLEX-focused clinical tutor</p>
         </div>
         <div className="ml-auto flex items-center gap-3">
           <ScoreBadge correct={score.correct} total={score.total} />
+          <button
+            onClick={onBack}
+            className="shrink-0 text-xs text-muted-foreground hover:text-foreground border border-border rounded-lg px-2.5 h-8 transition-all hover:border-brand-400"
+            title="Back to home"
+          >
+            ← Home
+          </button>
           {uploadedDoc && (
             <Badge
               variant="secondary"
@@ -682,7 +749,6 @@ export default function App() {
               📄 {uploadedDoc.name}
             </Badge>
           )}
-          {/* Instructions button */}
           <button
             onClick={() => { setDraftInstructions(customInstructions); setShowInstructions(v => !v); }}
             title="Custom instructions"
