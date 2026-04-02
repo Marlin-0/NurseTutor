@@ -63,8 +63,9 @@ const QUICK_ACTIONS = [
 ];
 
 function buildSystemPrompt(doc: UploadedDoc | null, customInstructions?: string): string {
+  const docContent = doc?.content ? doc.content.slice(0, 12000) : "";
   const docContext = doc
-    ? `\n\nThe student has uploaded study material titled "${doc.name}". Use this as the PRIMARY source when generating questions and explanations — pull directly from this content when possible:\n\n---\n${doc.content}\n---\n`
+    ? `\n\nThe student has uploaded study material titled "${doc.name}". Use this as the PRIMARY source when generating questions and explanations — pull directly from this content when possible:\n\n---\n${docContent}\n---\n`
     : "";
   const customContext = customInstructions?.trim()
     ? `\n\n━━━ CUSTOM INSTRUCTIONS FROM STUDENT ━━━\n${customInstructions.trim()}\nAlways follow the above instructions for every response.\n`
@@ -78,6 +79,7 @@ QUIZ PHILOSOPHY:
 - Target application and analysis level (Bloom's). The student should have to reason, not just remember.
 - When study material is uploaded, derive questions directly from that content.
 - Do NOT refer to or suggest selecting a topic — there is no topic selector in the interface. Just generate questions directly.
+- Do NOT use **bold** or any markdown formatting inside question text, options, or explanations — plain text only.
 
 You support two question formats:
 
@@ -106,6 +108,13 @@ E: [Option]
 ANSWERS: [Comma-separated correct letters, e.g. A,C,E — always 2–4 correct answers out of 5]
 EXPLANATION: [2–3 sentences: why each correct answer applies, why the distractors do not fit the clinical picture.]
 
+━━━ MULTIPLE QUESTIONS ━━━
+When the student asks for more than one question (e.g. "give me 5 MCQs", "3 SATA questions"), output each question in the correct format above, separated by a line containing only three dashes:
+
+---
+
+Output ONLY the questions separated by ---. No preamble, no numbering, no summary text.
+
 ━━━ TUTOR MODE ━━━
 For all non-quiz requests: explain clearly, use bullet points for lists, bold **key terms**, and keep answers clinically relevant and NCLEX-focused. Be encouraging, concise, and precise.`;
 }
@@ -126,11 +135,11 @@ async function callGroq(
       "Authorization": `Bearer ${apiKey}`,
     },
     body: JSON.stringify({
-      model: "llama-3.3-70b-versatile",
-      max_tokens: 2048,
+      model: "llama-3.1-8b-instant",
+      max_tokens: 4096,
       messages: [
         { role: "system", content: buildSystemPrompt(doc, customInstructions) },
-        ...history.map((turn) => ({ role: turn.role, content: turn.content })),
+        ...history.slice(-2).map((turn) => ({ role: turn.role, content: turn.content.slice(0, 2000) })),
       ],
     }),
   });
@@ -200,6 +209,35 @@ function parseSATA(
   } catch {
     return null;
   }
+}
+
+function parseBatch(raw: string): Message[] {
+  // Split on separator lines, try to parse each block as MCQ or SATA
+  const blocks = raw.split(/\n---\n/).map((b) => b.trim()).filter(Boolean);
+  const results: Message[] = [];
+
+  for (const block of blocks) {
+    const sata = parseSATA(block);
+    if (sata) {
+      results.push({ id: uid(), role: "assistant", type: "sata", ...sata, selected: [], submitted: false });
+      continue;
+    }
+    const mcq = parseMCQ(block);
+    if (mcq) {
+      results.push({ id: uid(), role: "assistant", type: "mcq", ...mcq });
+      continue;
+    }
+  }
+
+  // Fallback: try the whole response as a single question
+  if (results.length === 0) {
+    const sata = parseSATA(raw);
+    if (sata) return [{ id: uid(), role: "assistant", type: "sata", ...sata, selected: [], submitted: false }];
+    const mcq = parseMCQ(raw);
+    if (mcq) return [{ id: uid(), role: "assistant", type: "mcq", ...mcq }];
+  }
+
+  return results;
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -548,12 +586,24 @@ function StudentTutor({ onBack }: { onBack: () => void }) {
   );
   const [showInstructions, setShowInstructions] = useState(false);
   const [draftInstructions, setDraftInstructions] = useState(customInstructions);
+  const [questionIndex, setQuestionIndex] = useState(0);
   const bottomRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, loading]);
+
+  const questionMessages = messages.filter(
+    (m): m is MCQMessage | SATAMessage => m.role === "assistant" && (m.type === "mcq" || m.type === "sata")
+  );
+
+  // Go to the first question of the new batch when questions arrive
+  useEffect(() => {
+    if (questionMessages.length > 0) {
+      setQuestionIndex(0);
+    }
+  }, [questionMessages.length]);
 
   useEffect(() => {
     const welcome: TextMessage = {
@@ -590,41 +640,26 @@ function StudentTutor({ onBack }: { onBack: () => void }) {
         const raw = await callGroq(newHistory, uploadedDoc, customInstructions);
         setHistory((h) => [...h, { role: "assistant", content: raw }]);
 
-        const mcq = parseMCQ(raw);
-        const sata = parseSATA(raw);
-
-        if (sata) {
-          setMessages((prev) => [
-            ...prev,
-            {
-              id: uid(),
-              role: "assistant",
-              type: "sata",
-              ...sata,
-              selected: [],
-              submitted: false,
-            },
-          ]);
-        } else if (mcq) {
-          setMessages((prev) => [
-            ...prev,
-            { id: uid(), role: "assistant", type: "mcq", ...mcq },
-          ]);
+        const batch = parseBatch(raw);
+        if (batch.length > 0) {
+          setMessages((prev) => [...prev, ...batch]);
         } else {
           setMessages((prev) => [
             ...prev,
             { id: uid(), role: "assistant", type: "text", content: raw },
           ]);
         }
-      } catch {
+      } catch (err) {
+        console.error("NurseTutor error:", err);
         setMessages((prev) => [
           ...prev,
           {
             id: uid(),
             role: "assistant",
             type: "text",
-            content:
-              "Sorry, I had trouble connecting. Please try again.",
+            content: err instanceof Error && err.message.includes("429")
+          ? "You're sending requests too quickly — please wait a few seconds and try again."
+          : `Sorry, I had trouble connecting. Please try again.`,
           },
         ]);
       } finally {
@@ -821,7 +856,7 @@ function StudentTutor({ onBack }: { onBack: () => void }) {
       {/* ── Chat ── */}
       <ScrollArea className="flex-1 px-5 py-4">
         <div className="space-y-5 pb-2">
-          {messages.map((msg) => (
+          {messages.filter((m) => m.type === "text").map((msg) => (
             <div
               key={msg.id}
               className={cn(
@@ -836,31 +871,8 @@ function StudentTutor({ onBack }: { onBack: () => void }) {
                   <span className="text-xs font-semibold text-muted-foreground">You</span>
                 )}
               </div>
-
-              <div
-                className={cn(
-                  "rounded-2xl px-4 py-3 text-sm leading-relaxed",
-                  msg.role === "assistant" &&
-                    msg.type === "text" &&
-                    "bg-muted/60 border border-border rounded-tl-sm max-w-[82%]",
-                  msg.role === "assistant" &&
-                    (msg.type === "mcq" || msg.type === "sata") &&
-                    "bg-card border border-border rounded-tl-sm w-full max-w-full",
-                  msg.role === "user" &&
-                    "bg-brand-600 text-white rounded-tr-sm max-w-[82%]"
-                )}
-              >
+              <div className="rounded-2xl px-4 py-3 text-sm leading-relaxed bg-muted/60 border border-border rounded-tl-sm max-w-[82%]">
                 {msg.type === "text" && formatText(msg.content)}
-                {msg.type === "mcq" && (
-                  <MCQCard msg={msg} onAnswer={answerMCQ} />
-                )}
-                {msg.type === "sata" && (
-                  <SATACard
-                    msg={msg}
-                    onToggle={toggleSATA}
-                    onSubmit={submitSATA}
-                  />
-                )}
               </div>
             </div>
           ))}
@@ -879,6 +891,45 @@ function StudentTutor({ onBack }: { onBack: () => void }) {
           <div ref={bottomRef} />
         </div>
       </ScrollArea>
+
+      {/* ── Question navigator ── */}
+      {questionMessages.length > 0 && (
+        <div className="shrink-0 border-t border-border px-5 pt-4 pb-2 space-y-3">
+          <div className="bg-card border border-border rounded-2xl px-4 py-3 text-sm">
+            {questionMessages[questionIndex].type === "mcq" && (
+              <MCQCard msg={questionMessages[questionIndex] as MCQMessage} onAnswer={answerMCQ} />
+            )}
+            {questionMessages[questionIndex].type === "sata" && (
+              <SATACard
+                msg={questionMessages[questionIndex] as SATAMessage}
+                onToggle={toggleSATA}
+                onSubmit={submitSATA}
+              />
+            )}
+          </div>
+          {questionMessages.length > 1 && (
+            <div className="flex items-center justify-between">
+              <button
+                onClick={() => setQuestionIndex((i) => Math.max(0, i - 1))}
+                disabled={questionIndex === 0}
+                className="text-xs px-4 py-2 rounded-lg border border-border text-muted-foreground hover:border-brand-400 hover:text-brand-600 transition-all disabled:opacity-30 disabled:cursor-not-allowed"
+              >
+                ← Previous
+              </button>
+              <span className="text-xs text-muted-foreground">
+                {questionIndex + 1} / {questionMessages.length}
+              </span>
+              <button
+                onClick={() => setQuestionIndex((i) => Math.min(questionMessages.length - 1, i + 1))}
+                disabled={questionIndex === questionMessages.length - 1}
+                className="text-xs px-4 py-2 rounded-lg border border-border text-muted-foreground hover:border-brand-400 hover:text-brand-600 transition-all disabled:opacity-30 disabled:cursor-not-allowed"
+              >
+                Next →
+              </button>
+            </div>
+          )}
+        </div>
+      )}
 
       {/* ── Quick actions ── */}
       <div className="shrink-0 px-5 py-2 flex gap-2 overflow-x-auto">

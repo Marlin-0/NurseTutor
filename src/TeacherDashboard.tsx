@@ -269,12 +269,14 @@ export default function TeacherDashboard({ onBack }: { onBack: () => void }) {
   const [activeTabId, setActiveTabId] = useState("week-1");
   const [addingTab, setAddingTab] = useState(false);
   const [newTabName, setNewTabName] = useState("");
+  const [questionIndex, setQuestionIndex] = useState(0);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const activeTab = tabs.find((t) => t.id === activeTabId)!;
 
   function updateTab(id: string, patch: Partial<CourseTab>) {
     setTabs((prev) => prev.map((t) => (t.id === id ? { ...t, ...patch } : t)));
+    if (patch.questions) setQuestionIndex(0);
   }
 
   function addCustomTab() {
@@ -373,7 +375,7 @@ export default function TeacherDashboard({ onBack }: { onBack: () => void }) {
         {tabs.map((tab) => (
           <div key={tab.id} className="relative shrink-0">
             <button
-              onClick={() => setActiveTabId(tab.id)}
+              onClick={() => { setActiveTabId(tab.id); setQuestionIndex(0); }}
               className={cn(
                 "text-xs px-3 py-1.5 rounded-lg font-medium transition-all whitespace-nowrap",
                 activeTabId === tab.id
@@ -536,7 +538,7 @@ export default function TeacherDashboard({ onBack }: { onBack: () => void }) {
             <p className="text-xs text-red-500">{activeTab.error}</p>
           )}
 
-          {/* Questions */}
+          {/* Questions — slideshow */}
           {activeTab.questions.length > 0 && (
             <div className="space-y-4">
               <div className="flex items-center gap-2">
@@ -547,9 +549,33 @@ export default function TeacherDashboard({ onBack }: { onBack: () => void }) {
                   {activeTab.questions.length} questions
                 </span>
               </div>
-              {activeTab.questions.map((q, i) => (
-                <QuestionCard key={q.id} question={q} index={i} />
-              ))}
+
+              <QuestionCard
+                key={activeTab.questions[questionIndex].id}
+                question={activeTab.questions[questionIndex]}
+                index={questionIndex}
+              />
+
+              {/* Prev / Next */}
+              <div className="flex items-center justify-between pt-1">
+                <button
+                  onClick={() => setQuestionIndex((i) => Math.max(0, i - 1))}
+                  disabled={questionIndex === 0}
+                  className="text-xs px-4 py-2 rounded-lg border border-border text-muted-foreground hover:border-brand-400 hover:text-brand-600 transition-all disabled:opacity-30 disabled:cursor-not-allowed"
+                >
+                  ← Previous
+                </button>
+                <span className="text-xs text-muted-foreground">
+                  {questionIndex + 1} / {activeTab.questions.length}
+                </span>
+                <button
+                  onClick={() => setQuestionIndex((i) => Math.min(activeTab.questions.length - 1, i + 1))}
+                  disabled={questionIndex === activeTab.questions.length - 1}
+                  className="text-xs px-4 py-2 rounded-lg border border-border text-muted-foreground hover:border-brand-400 hover:text-brand-600 transition-all disabled:opacity-30 disabled:cursor-not-allowed"
+                >
+                  Next →
+                </button>
+              </div>
             </div>
           )}
         </div>
