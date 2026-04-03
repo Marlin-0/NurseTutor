@@ -115,11 +115,13 @@ ANSWERS: [Comma-separated correct letters, e.g. A,C,E — always 2–4 correct a
 EXPLANATION: [2–3 sentences: why each correct answer applies, why the distractors do not fit the clinical picture.]
 
 ━━━ MULTIPLE QUESTIONS ━━━
-When the student asks for more than one question (e.g. "give me 5 MCQs", "3 SATA questions"), output each question in the correct format above, separated by a line containing only three dashes:
+When the student asks for more than one question, you MUST generate EXACTLY the number requested — no more, no less. If they ask for 5, produce 5. If they ask for 10, produce 10. Never stop early.
+
+Separate each question with a line containing only three dashes:
 
 ---
 
-Output ONLY the questions separated by ---. No preamble, no numbering, no summary text.
+Output ONLY the questions separated by ---. No preamble, no numbering, no summary text. Do not add any closing remarks after the last question.
 
 ━━━ TUTOR MODE ━━━
 For all non-quiz requests: explain clearly, use bullet points for lists, and keep answers clinically relevant and NCLEX-focused. Be encouraging, concise, and precise.`;
@@ -147,7 +149,7 @@ async function callGroq(
     },
     body: JSON.stringify({
       model: "llama-3.1-8b-instant",
-      max_tokens: 1500,
+      max_tokens: 4000,
       messages: [
         { role: "system", content: buildSystemPrompt(docs, customInstructions) },
         ...history.slice(-2).map((turn) => ({ role: turn.role, content: turn.content.slice(0, 2000) })),
