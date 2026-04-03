@@ -615,10 +615,11 @@ function StudentTutor({ onBack }: { onBack: () => void }) {
     (m): m is MCQMessage | SATAMessage => m.role === "assistant" && (m.type === "mcq" || m.type === "sata")
   );
 
-  // Go to the first question of the new batch when questions arrive
+  // Go to the first question of the new batch and expand the navigator when questions arrive
   useEffect(() => {
     if (questionMessages.length > 0) {
       setQuestionIndex(0);
+      setQuestionMinimized(false);
     }
   }, [questionMessages.length]);
 
