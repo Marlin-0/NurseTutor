@@ -627,7 +627,7 @@ function StudentTutor({ onBack }: { onBack: () => void }) {
       role: "assistant",
       type: "text",
       content:
-        "Welcome! I'm NurseTutor — your clinical study companion.\n\nI write hard, scenario-based questions (MCQ and SATA) that push you to think like a nurse, not just memorize facts.\n\n**Upload your notes or slides** and I'll generate questions straight from your material. Otherwise, use the quick actions below or just ask me anything!",
+        "Welcome! I'm NurseTutor — your clinical study companion.\n\nUpload your notes or slides and I'll generate questions straight from your material. Otherwise, use the quick actions below or just ask me anything!\n\nTip: To get the most out of your questions, I recommend setting your preferences through the Instructions button in the top right — you can tell me your focus area, difficulty level, or anything else that helps me tailor to you.",
     };
     setMessages([welcome]);
   }, []);
