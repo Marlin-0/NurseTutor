@@ -603,6 +603,7 @@ function StudentTutor({ onBack }: { onBack: () => void }) {
   const [showInstructions, setShowInstructions] = useState(false);
   const [draftInstructions, setDraftInstructions] = useState(customInstructions);
   const [questionIndex, setQuestionIndex] = useState(0);
+  const [questionMinimized, setQuestionMinimized] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -964,38 +965,65 @@ function StudentTutor({ onBack }: { onBack: () => void }) {
 
       {/* ── Question navigator ── */}
       {questionMessages.length > 0 && (
-        <div className="shrink-0 border-t border-border px-5 pt-4 pb-2 space-y-3">
-          <div className="bg-card border border-border rounded-2xl px-4 py-3 text-sm">
-            {questionMessages[questionIndex].type === "mcq" && (
-              <MCQCard msg={questionMessages[questionIndex] as MCQMessage} onAnswer={answerMCQ} />
-            )}
-            {questionMessages[questionIndex].type === "sata" && (
-              <SATACard
-                msg={questionMessages[questionIndex] as SATAMessage}
-                onToggle={toggleSATA}
-                onSubmit={submitSATA}
-              />
-            )}
-          </div>
-          {questionMessages.length > 1 && (
-            <div className="flex items-center justify-between">
-              <button
-                onClick={() => setQuestionIndex((i) => Math.max(0, i - 1))}
-                disabled={questionIndex === 0}
-                className="text-xs px-4 py-2 rounded-lg border border-border text-muted-foreground hover:border-brand-400 hover:text-brand-600 transition-all disabled:opacity-30 disabled:cursor-not-allowed"
-              >
-                ← Previous
-              </button>
-              <span className="text-xs text-muted-foreground">
-                {questionIndex + 1} / {questionMessages.length}
-              </span>
-              <button
-                onClick={() => setQuestionIndex((i) => Math.min(questionMessages.length - 1, i + 1))}
-                disabled={questionIndex === questionMessages.length - 1}
-                className="text-xs px-4 py-2 rounded-lg border border-border text-muted-foreground hover:border-brand-400 hover:text-brand-600 transition-all disabled:opacity-30 disabled:cursor-not-allowed"
-              >
-                Next →
-              </button>
+        <div className="shrink-0 border-t border-border">
+          {/* Minimise toggle bar */}
+          <button
+            onClick={() => setQuestionMinimized(v => !v)}
+            className="w-full flex items-center justify-between px-5 py-2 hover:bg-muted/40 transition-all"
+          >
+            <span className="text-xs font-medium text-muted-foreground">
+              {questionMinimized ? "Show question" : "Hide question"}
+              {questionMessages.length > 1 && (
+                <span className="ml-2 text-[10px] bg-brand-100 text-brand-700 font-semibold px-1.5 py-0.5 rounded-full">
+                  {questionIndex + 1} / {questionMessages.length}
+                </span>
+              )}
+            </span>
+            <svg
+              viewBox="0 0 16 16"
+              fill="none"
+              className={cn("w-3.5 h-3.5 text-muted-foreground transition-transform", questionMinimized ? "rotate-180" : "")}
+            >
+              <path d="M4 6l4 4 4-4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
+            </svg>
+          </button>
+
+          {/* Question content */}
+          {!questionMinimized && (
+            <div className="px-5 pb-3 space-y-3">
+              <div className="bg-card border border-border rounded-2xl px-4 py-3 text-sm">
+                {questionMessages[questionIndex].type === "mcq" && (
+                  <MCQCard msg={questionMessages[questionIndex] as MCQMessage} onAnswer={answerMCQ} />
+                )}
+                {questionMessages[questionIndex].type === "sata" && (
+                  <SATACard
+                    msg={questionMessages[questionIndex] as SATAMessage}
+                    onToggle={toggleSATA}
+                    onSubmit={submitSATA}
+                  />
+                )}
+              </div>
+              {questionMessages.length > 1 && (
+                <div className="flex items-center justify-between">
+                  <button
+                    onClick={() => setQuestionIndex((i) => Math.max(0, i - 1))}
+                    disabled={questionIndex === 0}
+                    className="text-xs px-4 py-2 rounded-lg border border-border text-muted-foreground hover:border-brand-400 hover:text-brand-600 transition-all disabled:opacity-30 disabled:cursor-not-allowed"
+                  >
+                    ← Previous
+                  </button>
+                  <span className="text-xs text-muted-foreground">
+                    {questionIndex + 1} / {questionMessages.length}
+                  </span>
+                  <button
+                    onClick={() => setQuestionIndex((i) => Math.min(questionMessages.length - 1, i + 1))}
+                    disabled={questionIndex === questionMessages.length - 1}
+                    className="text-xs px-4 py-2 rounded-lg border border-border text-muted-foreground hover:border-brand-400 hover:text-brand-600 transition-all disabled:opacity-30 disabled:cursor-not-allowed"
+                  >
+                    Next →
+                  </button>
+                </div>
+              )}
             </div>
           )}
         </div>
