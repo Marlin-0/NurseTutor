@@ -475,7 +475,7 @@ export default function TeacherDashboard({ onBack }: { onBack: () => void }) {
 
   async function handleFileUpload(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
-    if (!file) return;
+    if (!file || !activeTab) return;
     e.target.value = "";
     try {
       const content = await extractText(file);
@@ -486,10 +486,12 @@ export default function TeacherDashboard({ onBack }: { onBack: () => void }) {
   }
 
   function removeFile(fileName: string) {
+    if (!activeTab) return;
     updateTab(activeTabId, { files: activeTab.files.filter((f) => f.name !== fileName) });
   }
 
   async function handleGenerate() {
+    if (!activeTab) return;
     updateTab(activeTabId, { loading: true, error: "" });
     try {
       const questions = await generateQuestionBank(activeTab.files, activeTab.label);
@@ -501,17 +503,20 @@ export default function TeacherDashboard({ onBack }: { onBack: () => void }) {
 
   // Learning outcome helpers
   function updateLearningOutcome(index: number, value: string) {
+    if (!activeTab) return;
     const outcomes = [...(activeTab.learningOutcomes ?? [])];
     outcomes[index] = value;
     updateTab(activeTabId, { learningOutcomes: outcomes });
   }
 
   function removeLearningOutcome(index: number) {
+    if (!activeTab) return;
     const outcomes = (activeTab.learningOutcomes ?? []).filter((_, i) => i !== index);
     updateTab(activeTabId, { learningOutcomes: outcomes });
   }
 
   function addLearningOutcome() {
+    if (!activeTab) return;
     updateTab(activeTabId, { learningOutcomes: [...(activeTab.learningOutcomes ?? []), ""] });
   }
 
