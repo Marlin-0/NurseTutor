@@ -63,31 +63,106 @@ const QUICK_ACTIONS = [
   { label: "Case scenario", prompt: "Give me a clinical nursing case scenario" },
 ];
 
-function buildSystemPrompt(docs: UploadedDoc[], customInstructions?: string): string {
-  const TOTAL_CHAR_BUDGET = 3000;
-  const docsWithContent = docs.filter(d => d.content);
+// ─── Keyword retrieval ────────────────────────────────────────────────────────
+
+const STOP_WORDS = new Set([
+  "a","an","the","is","it","in","on","at","to","for","of","and","or","but",
+  "with","this","that","are","was","be","do","does","did","have","has","had",
+  "will","would","can","could","should","may","might","what","which","who",
+  "how","when","where","why","not","from","by","as","if","then","than","so",
+  "just","about","also","their","there","they","you","your","me","my","we",
+  "our","its","was","were","been","being","am","get","got","give","make",
+]);
+
+function queryKeywords(text: string): Set<string> {
+  return new Set(
+    text.toLowerCase()
+      .replace(/[^\w\s]/g, " ")
+      .split(/\s+/)
+      .filter((w) => w.length > 3 && !STOP_WORDS.has(w))
+  );
+}
+
+function scoreChunk(chunk: string, keywords: Set<string>): number {
+  const words = queryKeywords(chunk);
+  let score = 0;
+  for (const kw of keywords) {
+    if (words.has(kw)) score += 1;
+    else if ([...words].some((w) => w.startsWith(kw) || kw.startsWith(w))) score += 0.5;
+  }
+  return score;
+}
+
+function getRelevantChunks(content: string, query: string, budget: number): string {
+  // Split into paragraph-sized chunks, filter blanks
+  const chunks = content
+    .split(/\n{2,}/)
+    .map((c) => c.trim())
+    .filter((c) => c.length > 60);
+
+  // If content fits in budget or no meaningful query, just slice from start
+  if (content.length <= budget || !query.trim()) return content.slice(0, budget);
+
+  const keywords = queryKeywords(query);
+  if (keywords.size === 0) return content.slice(0, budget);
+
+  // Score every chunk, sort best-first, pack into budget
+  const scored = chunks
+    .map((chunk) => ({ chunk, score: scoreChunk(chunk, keywords) }))
+    .sort((a, b) => b.score - a.score);
+
+  let result = "";
+  for (const { chunk } of scored) {
+    if (result.length + chunk.length + 2 > budget) break;
+    result += chunk + "\n\n";
+  }
+
+  // Fallback: nothing matched, use beginning
+  return result.trim() || content.slice(0, budget);
+}
+
+// ─── System prompt ────────────────────────────────────────────────────────────
+
+function buildSystemPrompt(docs: UploadedDoc[], customInstructions?: string, query?: string): string {
+  const TOTAL_CHAR_BUDGET = 6000;
+  const docsWithContent = docs.filter((d) => d.content);
   const charsEach = docsWithContent.length > 0
     ? Math.floor(TOTAL_CHAR_BUDGET / docsWithContent.length)
     : TOTAL_CHAR_BUDGET;
+
   const docContext = docs.length > 0
     ? `\n\nThe student has uploaded the following study materials. Use these as the PRIMARY source when generating questions and explanations — pull directly from this content when possible:\n\n` +
-      docs.map(d => `--- ${d.name} ---\n${d.content ? d.content.slice(0, charsEach) : "(PDF — use filename for context)"}`).join("\n\n") + "\n"
+      docs.map((d) =>
+        `--- ${d.name} ---\n${d.content
+          ? getRelevantChunks(d.content, query ?? "", charsEach)
+          : "(No text content could be extracted from this file)"
+        }`
+      ).join("\n\n") + "\n"
     : "";
+
   const customContext = customInstructions?.trim()
     ? `\n\n━━━ CUSTOM INSTRUCTIONS FROM STUDENT ━━━\n${customInstructions.trim()}\nAlways follow the above instructions for every response.\n`
     : "";
 
-  return `You are NurseTutor, a rigorous and expert nursing tutor helping students prepare for NCLEX and clinical practice. You write challenging, clinically-grounded questions that mirror real patient care situations.${docContext}${customContext}
+  const groundingRules = docs.length > 0
+    ? `\n\n━━━ SOURCE RULES ━━━
+- Answer using the uploaded study material above as your primary source.
+- If the student asks about something not present in the provided content, say clearly: "That topic isn't in the sections I have access to from your uploaded material." Then offer a brief general nursing answer if helpful.
+- Never invent specific details (drug doses, lab values, procedures) and present them as coming from the uploaded document.
+- If you are drawing on general nursing knowledge rather than the uploaded content, say so briefly.`
+    : `\n\n━━━ SOURCE RULES ━━━
+- No study materials are uploaded. Make this clear if the student asks about a specific document or course material: tell them to upload the file first.
+- Your answers draw from general nursing and NCLEX knowledge only — do not imply you have seen their specific course content.`;
 
-QUIZ PHILOSOPHY:
+  return `You are NurseTutor, a rigorous and expert nursing tutor helping students prepare for NCLEX and clinical practice. You write challenging, clinically-grounded questions that mirror real patient care situations.${docContext}${customContext}${groundingRules}
+
+━━━ QUIZ PHILOSOPHY ━━━
 - Questions MUST be clinical and scenario-based — always describe a real patient (age, chief complaint, relevant vitals/labs/history). Never ask pure recall questions like "What is the normal range of X?"
 - Distractors must be sophisticated and plausible. A good distractor is something a reasonable but less experienced nurse might actually choose. Avoid obviously wrong answers.
 - Target application and analysis level (Bloom's). The student should have to reason, not just remember.
 - When study material is uploaded, derive questions directly from that content.
 - Do NOT refer to or suggest selecting a topic — there is no topic selector in the interface. Just generate questions directly.
 - Do NOT use **bold** or any markdown formatting inside question text, options, or explanations — plain text only.
-
-You support two question formats:
 
 ━━━ MCQ FORMAT ━━━
 When asked for a multiple-choice question, respond EXACTLY in this format (no preamble, no extra text):
@@ -115,8 +190,7 @@ ANSWERS: [Comma-separated correct letters, e.g. A,C,E — always 2–4 correct a
 EXPLANATION: [2–3 sentences: why each correct answer applies, why the distractors do not fit the clinical picture.]
 
 ━━━ MULTIPLE QUESTIONS ━━━
-When the student asks for more than one question, you MUST generate EXACTLY the number requested — no more, no less. If they ask for 5, produce 5. If they ask for 10, produce 10. Never stop early.
-
+When the student asks for more than one question, you MUST generate EXACTLY the number requested — no more, no less. Never stop early.
 Separate each question with a line containing only three dashes:
 
 ---
@@ -141,6 +215,9 @@ async function callGroq(
 ): Promise<GroqResponse> {
   const apiKey = import.meta.env.VITE_GROQ_API_KEY as string;
 
+  // Use the last user message as the retrieval query
+  const lastUserMsg = [...history].reverse().find((t) => t.role === "user")?.content ?? "";
+
   const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
     method: "POST",
     headers: {
@@ -151,7 +228,7 @@ async function callGroq(
       model: "llama-3.1-8b-instant",
       max_tokens: 4000,
       messages: [
-        { role: "system", content: buildSystemPrompt(docs, customInstructions) },
+        { role: "system", content: buildSystemPrompt(docs, customInstructions, lastUserMsg) },
         ...history.slice(-2).map((turn) => ({ role: turn.role, content: turn.content.slice(0, 2000) })),
       ],
     }),
@@ -169,20 +246,22 @@ async function callGroq(
 function parseMCQ(
   raw: string
 ): Omit<MCQMessage, "id" | "role" | "type" | "chosen"> | null {
-  if (!raw.trimStart().startsWith("MCQ")) return null;
+  const start = raw.search(/\bMCQ\b/);
+  if (start === -1) return null;
+  const trimmed = raw.slice(start);
   try {
-    const q = raw.match(/Question:\s*([\s\S]+?)(?=\nA:)/)?.[1]?.trim();
-    const a = raw.match(/^A:\s*(.+)/m)?.[1]?.trim();
-    const b = raw.match(/^B:\s*(.+)/m)?.[1]?.trim();
-    const c = raw.match(/^C:\s*(.+)/m)?.[1]?.trim();
-    const d = raw.match(/^D:\s*(.+)/m)?.[1]?.trim();
-    const ans = raw.match(/ANSWER:\s*([ABCD])/)?.[1]?.trim() as
+    const q = trimmed.match(/Question:\s*([\s\S]+?)(?=\nA:)/)?.[1]?.trim();
+    const a = trimmed.match(/^A:\s*(.+)/m)?.[1]?.trim();
+    const b = trimmed.match(/^B:\s*(.+)/m)?.[1]?.trim();
+    const c = trimmed.match(/^C:\s*(.+)/m)?.[1]?.trim();
+    const d = trimmed.match(/^D:\s*(.+)/m)?.[1]?.trim();
+    const ans = trimmed.match(/ANSWER:\s*([ABCD])/)?.[1]?.trim() as
       | "A"
       | "B"
       | "C"
       | "D"
       | undefined;
-    const exp = raw.match(/EXPLANATION:\s*([\s\S]+)/)?.[1]?.trim();
+    const exp = trimmed.match(/EXPLANATION:\s*([\s\S]+)/)?.[1]?.trim();
     if (!q || !a || !b || !c || !d || !ans || !exp) return null;
     return {
       question: q,
@@ -198,16 +277,18 @@ function parseMCQ(
 function parseSATA(
   raw: string
 ): Omit<SATAMessage, "id" | "role" | "type" | "selected" | "submitted"> | null {
-  if (!raw.trimStart().startsWith("SATA")) return null;
+  const start = raw.search(/\bSATA\b/);
+  if (start === -1) return null;
+  const trimmed = raw.slice(start);
   try {
-    const q = raw.match(/Question:\s*([\s\S]+?)(?=\nA:)/)?.[1]?.trim();
-    const a = raw.match(/^A:\s*(.+)/m)?.[1]?.trim();
-    const b = raw.match(/^B:\s*(.+)/m)?.[1]?.trim();
-    const c = raw.match(/^C:\s*(.+)/m)?.[1]?.trim();
-    const d = raw.match(/^D:\s*(.+)/m)?.[1]?.trim();
-    const e = raw.match(/^E:\s*(.+)/m)?.[1]?.trim();
-    const ansRaw = raw.match(/ANSWERS:\s*([A-E,\s]+)/)?.[1]?.trim();
-    const exp = raw.match(/EXPLANATION:\s*([\s\S]+)/)?.[1]?.trim();
+    const q = trimmed.match(/Question:\s*([\s\S]+?)(?=\nA:)/)?.[1]?.trim();
+    const a = trimmed.match(/^A:\s*(.+)/m)?.[1]?.trim();
+    const b = trimmed.match(/^B:\s*(.+)/m)?.[1]?.trim();
+    const c = trimmed.match(/^C:\s*(.+)/m)?.[1]?.trim();
+    const d = trimmed.match(/^D:\s*(.+)/m)?.[1]?.trim();
+    const e = trimmed.match(/^E:\s*(.+)/m)?.[1]?.trim();
+    const ansRaw = trimmed.match(/ANSWERS:\s*([A-E,\s]+)/)?.[1]?.trim();
+    const exp = trimmed.match(/EXPLANATION:\s*([\s\S]+)/)?.[1]?.trim();
     if (!q || !a || !b || !c || !d || !e || !ansRaw || !exp) return null;
     const answers = ansRaw
       .split(",")
@@ -524,53 +605,65 @@ function ScoreBadge({ correct, total }: { correct: number; total: number }) {
 
 function LandingScreen({ onSelect }: { onSelect: (role: "student" | "teacher") => void }) {
   return (
-    <div className="flex flex-col h-screen bg-background font-sans items-center justify-center px-6">
-      <div className="flex flex-col items-center gap-2 mb-10">
-        <div className="w-16 h-16 rounded-full overflow-hidden mb-2">
-          <img src="/nurse-avatar.png" alt="NurseTutor" className="w-full h-full object-cover" />
-        </div>
-        <h1 className="text-2xl font-bold tracking-tight text-foreground">NurseTutor</h1>
-        <p className="text-sm text-muted-foreground">NCLEX-focused clinical learning platform</p>
+    <div className="min-h-screen bg-gradient-to-br from-slate-100 via-white to-white font-sans flex flex-col items-center justify-center px-6">
+
+      {/* Decorative blobs */}
+      <div className="pointer-events-none fixed inset-0 overflow-hidden">
+        <div className="absolute -top-32 -left-32 w-96 h-96 rounded-full bg-slate-200/50 blur-3xl" />
+        <div className="absolute -bottom-32 -right-32 w-96 h-96 rounded-full bg-gray-100/80 blur-3xl" />
       </div>
 
-      <p className="text-sm font-medium text-foreground mb-5">How are you using NurseTutor today?</p>
+      {/* Hero */}
+      <div className="relative flex flex-col items-center gap-3 mb-12 text-center">
+        <div className="w-24 h-24 rounded-2xl overflow-hidden shadow-xl ring-4 ring-white mb-1">
+          <img src="/nurse-avatar.png" alt="NurseTutor" className="w-full h-full object-cover" />
+        </div>
+        <h1 className="text-4xl font-bold tracking-tight text-foreground">NurseTutor</h1>
+        <p className="text-sm text-muted-foreground max-w-xs leading-relaxed">
+          AI-powered NCLEX prep that is tailored to your course material
+        </p>
+      </div>
 
-      <div className="flex flex-col sm:flex-row gap-4 w-full max-w-md">
+      <p className="relative text-sm font-medium text-foreground mb-6">
+        Which role suits you best?
+      </p>
+
+      <div className="relative flex flex-col sm:flex-row gap-5 w-full max-w-lg">
         {/* Student card */}
         <button
           onClick={() => onSelect("student")}
-          className="flex-1 group rounded-2xl border-2 border-border bg-card hover:border-brand-400 hover:bg-brand-50/40 transition-all p-6 text-left space-y-3"
+          className="flex-1 group rounded-2xl border border-border/60 bg-white shadow-md hover:shadow-xl hover:border-brand-300 hover:-translate-y-0.5 transition-all duration-200 p-7 text-left space-y-4"
         >
-          <div className="w-11 h-11 rounded-xl bg-brand-100 flex items-center justify-center text-2xl">
+          <div className="w-12 h-12 rounded-xl bg-brand-50 border border-brand-100 flex items-center justify-center text-2xl shadow-sm">
             🎓
           </div>
           <div>
-            <p className="font-semibold text-sm text-foreground group-hover:text-brand-700">I'm a Student</p>
-            <p className="text-xs text-muted-foreground mt-0.5 leading-relaxed">
+            <p className="font-bold text-base text-foreground group-hover:text-brand-700 transition-colors">I'm a Student</p>
+            <p className="text-xs text-muted-foreground mt-1.5 leading-relaxed">
               Practice with MCQ &amp; SATA questions, upload your notes, and get instant explanations.
             </p>
           </div>
-          <span className="inline-block text-xs font-semibold text-brand-600 group-hover:translate-x-0.5 transition-transform">
-            Start studying →
+          <span className="inline-flex items-center gap-1 text-xs font-semibold text-brand-600 group-hover:gap-2 transition-all">
+            Start studying <span>→</span>
           </span>
         </button>
 
         {/* Teacher card */}
         <button
           onClick={() => onSelect("teacher")}
-          className="flex-1 group rounded-2xl border-2 border-border bg-card hover:border-brand-400 hover:bg-brand-50/40 transition-all p-6 text-left space-y-3"
+          className="flex-1 group rounded-2xl border border-border/60 bg-white shadow-md hover:shadow-xl hover:border-brand-300 hover:-translate-y-0.5 transition-all duration-200 p-7 text-left space-y-4"
         >
-          <div className="w-11 h-11 rounded-xl bg-brand-100 flex items-center justify-center text-2xl">
+          <div className="w-12 h-12 rounded-xl bg-slate-50 border border-slate-100 flex items-center justify-center text-2xl shadow-sm">
             📋
           </div>
           <div>
-            <p className="font-semibold text-sm text-foreground group-hover:text-brand-700">I'm a Teacher</p>
-            <p className="text-xs text-muted-foreground mt-0.5 leading-relaxed">
+            <p className="font-bold text-base text-foreground group-hover:text-brand-700 transition-colors">I'm a Teacher</p>
+            <p className="text-xs text-muted-foreground mt-1.5 leading-relaxed">
               Build weekly question banks from your course material and export them for exams.
             </p>
           </div>
-          <span className="inline-block text-xs font-semibold text-brand-600 group-hover:translate-x-0.5 transition-transform">
-            Open dashboard →
+          <span className="inline-flex items-center gap-1 text-xs font-semibold text-brand-600 group-hover:gap-2 transition-all">
+            Open dashboard <span>→</span>
           </span>
         </button>
       </div>
@@ -746,17 +839,12 @@ function StudentTutor({ onBack }: { onBack: () => void }) {
 
       const added: UploadedDoc[] = [];
       for (const file of files) {
-        const isPdf = file.name.toLowerCase().endsWith(".pdf");
-        if (isPdf) {
-          added.push({ name: file.name, content: "", isPdf: true });
-        } else {
-          try {
-            const content = await extractText(file);
-            added.push({ name: file.name, content });
-          } catch {
-            setMessages((prev) => [...prev, { id: uid(), role: "assistant", type: "text",
-              content: `Sorry, I couldn't read ${file.name}. Try .txt, .md, .docx, or .pptx.` }]);
-          }
+        try {
+          const content = await extractText(file);
+          added.push({ name: file.name, content });
+        } catch {
+          setMessages((prev) => [...prev, { id: uid(), role: "assistant", type: "text",
+            content: `Sorry, I couldn't read ${file.name}. Try .txt, .md, .pdf, .docx, .pptx, or an image (jpg, png).` }]);
         }
       }
 
@@ -1051,14 +1139,14 @@ function StudentTutor({ onBack }: { onBack: () => void }) {
         <input
           ref={fileInputRef}
           type="file"
-          accept=".txt,.md,.csv,.rtf,.pdf,.docx,.pptx"
+          accept=".txt,.md,.csv,.rtf,.pdf,.docx,.pptx,.png,.jpg,.jpeg,.webp,.gif"
           multiple
           className="hidden"
           onChange={handleFileUpload}
         />
         <button
           onClick={() => fileInputRef.current?.click()}
-          title="Upload study notes (.txt, .md, .pdf)"
+          title="Upload study notes (.txt, .md, .pdf, .docx, .pptx, or images)"
           className={cn(
             "shrink-0 w-9 h-9 rounded-lg border flex items-center justify-center transition-all",
             uploadedDocs.length > 0
