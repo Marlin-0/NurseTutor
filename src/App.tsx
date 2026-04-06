@@ -131,14 +131,19 @@ function getRelevantChunks(chunks: DocChunk[], query: string, budget: number): s
 
 function buildSystemPrompt(docs: UploadedDoc[], customInstructions?: string, query?: string): string {
   const TOTAL_CHAR_BUDGET = 6000;
-  const docsWithChunks = docs.filter((d) => d.chunks.length > 0);
+  // Guard: docs uploaded before the chunks refactor may lack the chunks field
+  const safeDocs = docs.map((d) => ({
+    ...d,
+    chunks: Array.isArray(d.chunks) ? d.chunks : [],
+  }));
+  const docsWithChunks = safeDocs.filter((d) => d.chunks.length > 0);
   const charsEach = docsWithChunks.length > 0
     ? Math.floor(TOTAL_CHAR_BUDGET / docsWithChunks.length)
     : TOTAL_CHAR_BUDGET;
 
-  const docContext = docs.length > 0
+  const docContext = safeDocs.length > 0
     ? `\n\nThe student has uploaded the following study materials. Each section is labelled with its page, slide, or heading. Use these as the PRIMARY source — pull directly from this content when possible:\n\n` +
-      docs.map((d) =>
+      safeDocs.map((d) =>
         `--- ${d.name} ---\n${d.chunks.length > 0
           ? getRelevantChunks(d.chunks, query ?? "", charsEach)
           : "(No text content could be extracted from this file)"
@@ -150,7 +155,7 @@ function buildSystemPrompt(docs: UploadedDoc[], customInstructions?: string, que
     ? `\n\n━━━ CUSTOM INSTRUCTIONS FROM STUDENT ━━━\n${customInstructions.trim()}\nAlways follow the above instructions for every response.\n`
     : "";
 
-  const groundingRules = docs.length > 0
+  const groundingRules = safeDocs.length > 0
     ? `\n\n━━━ SOURCE RULES ━━━
 - Answer using the uploaded study material above as your primary source. Sections are labelled [Page X], [Slide X], or [Section Name] — reference these labels when relevant (e.g. "According to Page 4...").
 - If the student asks about something not present in the provided sections, say clearly: "That topic isn't in the sections I have access to from your uploaded material." Then offer a brief general nursing answer if helpful.
@@ -772,15 +777,16 @@ function StudentTutor({ onBack }: { onBack: () => void }) {
         }
       } catch (err) {
         console.error("NurseTutor error:", err);
+        const errMsg = err instanceof Error ? err.message : String(err);
         setMessages((prev) => [
           ...prev,
           {
             id: uid(),
             role: "assistant",
             type: "text",
-            content: err instanceof Error && err.message.includes("429")
-          ? "You're sending requests too quickly — please wait a few seconds and try again."
-          : `Sorry, I had trouble connecting. Please try again.`,
+            content: errMsg.includes("429")
+              ? "You're sending requests too quickly — please wait a few seconds and try again."
+              : `Sorry, I had trouble connecting. (${errMsg})`,
           },
         ]);
       } finally {
