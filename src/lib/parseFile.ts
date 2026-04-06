@@ -2,7 +2,6 @@ import mammoth from "mammoth";
 import JSZip from "jszip";
 import * as pdfjsLib from "pdfjs-dist";
 
-// Point the worker at the bundled worker file
 pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
   "pdfjs-dist/build/pdf.worker.mjs",
   import.meta.url
@@ -10,52 +9,73 @@ pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
 
 const IMAGE_EXTS = [".png", ".jpg", ".jpeg", ".webp", ".gif"];
 
-/**
- * Extracts plain text from any supported file type.
- * Supports: .txt, .md, .csv, .rtf, .docx, .pptx, .png, .jpg, .jpeg, .webp, .gif
- */
-export async function extractText(file: File): Promise<string> {
-  const name = file.name.toLowerCase();
+// ─── Types ────────────────────────────────────────────────────────────────────
 
-  if (name.endsWith(".docx")) return extractDocx(file);
-  if (name.endsWith(".pptx")) return extractPptx(file);
-  if (name.endsWith(".pdf")) return extractPdf(file);
-  if (IMAGE_EXTS.some((ext) => name.endsWith(ext))) return extractImage(file);
-
-  // Plain text formats
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = (e) => resolve(e.target?.result as string);
-    reader.onerror = reject;
-    reader.readAsText(file);
-  });
+export interface DocChunk {
+  label: string;   // e.g. "Page 3", "Section: Neurological Assessment", "Slide 7"
+  text: string;
 }
 
-async function extractPdf(file: File): Promise<string> {
+// ─── Public API ───────────────────────────────────────────────────────────────
+
+/**
+ * Extracts structured chunks from a file.
+ * Each chunk has a label (page/section/slide) and its text.
+ */
+export async function extractChunks(file: File): Promise<DocChunk[]> {
+  const name = file.name.toLowerCase();
+
+  if (name.endsWith(".docx")) return extractDocxChunks(file);
+  if (name.endsWith(".pptx")) return extractPptxChunks(file);
+  if (name.endsWith(".pdf"))  return extractPdfChunks(file);
+  if (IMAGE_EXTS.some((ext) => name.endsWith(ext))) return extractImageChunks(file);
+
+  // Plain text — split by headings/sections
+  const raw = await readAsText(file);
+  return splitTextIntoChunks(raw);
+}
+
+/**
+ * Flat text fallback — joins all chunks for cases that still need a string.
+ */
+export async function extractText(file: File): Promise<string> {
+  const chunks = await extractChunks(file);
+  return chunks.map((c) => `[${c.label}]\n${c.text}`).join("\n\n");
+}
+
+// ─── PDF ──────────────────────────────────────────────────────────────────────
+
+async function extractPdfChunks(file: File): Promise<DocChunk[]> {
   const arrayBuffer = await file.arrayBuffer();
   const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
-  const pages: string[] = [];
+  const chunks: DocChunk[] = [];
 
   for (let i = 1; i <= pdf.numPages; i++) {
     const page = await pdf.getPage(i);
     const content = await page.getTextContent();
-    const pageText = content.items
+    const text = content.items
       .map((item) => ("str" in item ? item.str : ""))
       .join(" ")
       .trim();
-    if (pageText) pages.push(pageText);
+    if (text.length > 20) {
+      chunks.push({ label: `Page ${i}`, text });
+    }
   }
 
-  return pages.join("\n\n");
+  return chunks;
 }
 
-async function extractDocx(file: File): Promise<string> {
+// ─── DOCX ─────────────────────────────────────────────────────────────────────
+
+async function extractDocxChunks(file: File): Promise<DocChunk[]> {
   const arrayBuffer = await file.arrayBuffer();
   const result = await mammoth.extractRawText({ arrayBuffer });
-  return result.value;
+  return splitTextIntoChunks(result.value);
 }
 
-async function extractPptx(file: File): Promise<string> {
+// ─── PPTX ─────────────────────────────────────────────────────────────────────
+
+async function extractPptxChunks(file: File): Promise<DocChunk[]> {
   const arrayBuffer = await file.arrayBuffer();
   const zip = await JSZip.loadAsync(arrayBuffer);
 
@@ -67,22 +87,25 @@ async function extractPptx(file: File): Promise<string> {
       return numA - numB;
     });
 
-  const pages: string[] = [];
+  const chunks: DocChunk[] = [];
 
-  for (const slideName of slideFiles) {
-    const xml = await zip.files[slideName].async("string");
+  for (let i = 0; i < slideFiles.length; i++) {
+    const xml = await zip.files[slideFiles[i]].async("string");
     const matches = [...xml.matchAll(/<a:t[^>]*>([^<]*)<\/a:t>/g)];
     const text = matches.map((m) => m[1]).join(" ").trim();
-    if (text) pages.push(text);
+    if (text.length > 10) {
+      chunks.push({ label: `Slide ${i + 1}`, text });
+    }
   }
 
-  return pages.join("\n\n");
+  return chunks;
 }
 
-async function extractImage(file: File): Promise<string> {
+// ─── Image OCR ────────────────────────────────────────────────────────────────
+
+async function extractImageChunks(file: File): Promise<DocChunk[]> {
   const apiKey = import.meta.env.VITE_GROQ_API_KEY as string;
 
-  // Convert image to base64 data URL
   const base64 = await new Promise<string>((resolve, reject) => {
     const reader = new FileReader();
     reader.onload = (e) => resolve(e.target?.result as string);
@@ -107,10 +130,7 @@ async function extractImage(file: File): Promise<string> {
               type: "text",
               text: "Extract all text from this image exactly as it appears. Preserve headings, bullet points, and structure. Output only the extracted text — no commentary, no explanations.",
             },
-            {
-              type: "image_url",
-              image_url: { url: base64 },
-            },
+            { type: "image_url", image_url: { url: base64 } },
           ],
         },
       ],
@@ -119,5 +139,86 @@ async function extractImage(file: File): Promise<string> {
 
   if (!res.ok) throw new Error(`OCR API error ${res.status}`);
   const data = await res.json();
-  return data.choices[0].message.content as string;
+  const text = data.choices[0].message.content as string;
+
+  // Split the OCR result into sections too
+  return splitTextIntoChunks(text, "Image");
+}
+
+// ─── Text section splitter ────────────────────────────────────────────────────
+
+/**
+ * Splits plain text into labelled section chunks.
+ * Detects headings: ALL CAPS lines, lines ending with ":", numbered headings,
+ * markdown headings (# / ##), and chapter/section markers.
+ */
+function splitTextIntoChunks(text: string, fallbackLabel = "Section"): DocChunk[] {
+  const lines = text.split("\n");
+  const chunks: DocChunk[] = [];
+
+  let currentLabel = fallbackLabel;
+  let currentLines: string[] = [];
+  let sectionIndex = 1;
+
+  const isHeading = (line: string): boolean => {
+    const t = line.trim();
+    if (!t || t.length > 120) return false;
+    if (/^#{1,3}\s/.test(t)) return true;                          // markdown heading
+    if (/^(chapter|section|unit|topic|part)\s+\d+/i.test(t)) return true;
+    if (/^\d+[\.\)]\s+[A-Z]/.test(t)) return true;                 // "1. Heading" or "1) Heading"
+    if (/^[A-Z][A-Z\s\-:]{4,}$/.test(t)) return true;              // ALL CAPS LINE
+    if (/^[A-Z][^.!?]{3,60}:$/.test(t)) return true;               // "Heading:"
+    return false;
+  };
+
+  for (const line of lines) {
+    if (isHeading(line)) {
+      // Save previous section if it has content
+      const body = currentLines.join("\n").trim();
+      if (body.length > 30) {
+        chunks.push({ label: currentLabel, text: body });
+      }
+      currentLabel = line.trim().replace(/^#+\s*/, "");
+      currentLines = [];
+      sectionIndex++;
+    } else {
+      currentLines.push(line);
+    }
+  }
+
+  // Push final section
+  const body = currentLines.join("\n").trim();
+  if (body.length > 30) {
+    chunks.push({ label: currentLabel, text: body });
+  }
+
+  // If nothing was split (no headings found), fall back to paragraph chunks
+  if (chunks.length <= 1) {
+    return splitByParagraphs(text, fallbackLabel);
+  }
+
+  return chunks;
+}
+
+function splitByParagraphs(text: string, fallbackLabel: string): DocChunk[] {
+  const paragraphs = text
+    .split(/\n{2,}/)
+    .map((p) => p.trim())
+    .filter((p) => p.length > 40);
+
+  return paragraphs.map((text, i) => ({
+    label: `${fallbackLabel} ${i + 1}`,
+    text,
+  }));
+}
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+function readAsText(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = (e) => resolve(e.target?.result as string);
+    reader.onerror = reject;
+    reader.readAsText(file);
+  });
 }

@@ -5,7 +5,7 @@ import { Input } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { cn } from "@/lib/utils";
 import TeacherDashboard from "./TeacherDashboard";
-import { extractText } from "./lib/parseFile";
+import { extractChunks, DocChunk } from "./lib/parseFile";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -50,8 +50,7 @@ interface ConversationTurn {
 
 interface UploadedDoc {
   name: string;
-  content: string;
-  isPdf?: boolean;
+  chunks: DocChunk[];
 }
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -83,28 +82,34 @@ function queryKeywords(text: string): Set<string> {
   );
 }
 
-function scoreChunk(chunk: string, keywords: Set<string>): number {
-  const words = queryKeywords(chunk);
+function scoreChunk(chunk: DocChunk, keywords: Set<string>): number {
+  const words = queryKeywords(chunk.text);
+  const labelWords = queryKeywords(chunk.label);
   let score = 0;
   for (const kw of keywords) {
+    // Label matches score higher — a heading match is very strong signal
+    if (labelWords.has(kw)) score += 3;
+    else if ([...labelWords].some((w) => w.startsWith(kw) || kw.startsWith(w))) score += 1.5;
+    // Body matches
     if (words.has(kw)) score += 1;
     else if ([...words].some((w) => w.startsWith(kw) || kw.startsWith(w))) score += 0.5;
   }
   return score;
 }
 
-function getRelevantChunks(content: string, query: string, budget: number): string {
-  // Split into paragraph-sized chunks, filter blanks
-  const chunks = content
-    .split(/\n{2,}/)
-    .map((c) => c.trim())
-    .filter((c) => c.length > 60);
+function getRelevantChunks(chunks: DocChunk[], query: string, budget: number): string {
+  if (chunks.length === 0) return "";
 
-  // If content fits in budget or no meaningful query, just slice from start
-  if (content.length <= budget || !query.trim()) return content.slice(0, budget);
+  const fullText = chunks.map((c) => `[${c.label}]\n${c.text}`).join("\n\n");
+
+  // If everything fits, return it all
+  if (fullText.length <= budget) return fullText;
+
+  // No query — return first N chars
+  if (!query.trim()) return fullText.slice(0, budget);
 
   const keywords = queryKeywords(query);
-  if (keywords.size === 0) return content.slice(0, budget);
+  if (keywords.size === 0) return fullText.slice(0, budget);
 
   // Score every chunk, sort best-first, pack into budget
   const scored = chunks
@@ -113,28 +118,29 @@ function getRelevantChunks(content: string, query: string, budget: number): stri
 
   let result = "";
   for (const { chunk } of scored) {
-    if (result.length + chunk.length + 2 > budget) break;
-    result += chunk + "\n\n";
+    const entry = `[${chunk.label}]\n${chunk.text}\n\n`;
+    if (result.length + entry.length > budget) break;
+    result += entry;
   }
 
-  // Fallback: nothing matched, use beginning
-  return result.trim() || content.slice(0, budget);
+  // Fallback: nothing fit, use beginning
+  return result.trim() || fullText.slice(0, budget);
 }
 
 // ─── System prompt ────────────────────────────────────────────────────────────
 
 function buildSystemPrompt(docs: UploadedDoc[], customInstructions?: string, query?: string): string {
   const TOTAL_CHAR_BUDGET = 6000;
-  const docsWithContent = docs.filter((d) => d.content);
-  const charsEach = docsWithContent.length > 0
-    ? Math.floor(TOTAL_CHAR_BUDGET / docsWithContent.length)
+  const docsWithChunks = docs.filter((d) => d.chunks.length > 0);
+  const charsEach = docsWithChunks.length > 0
+    ? Math.floor(TOTAL_CHAR_BUDGET / docsWithChunks.length)
     : TOTAL_CHAR_BUDGET;
 
   const docContext = docs.length > 0
-    ? `\n\nThe student has uploaded the following study materials. Use these as the PRIMARY source when generating questions and explanations — pull directly from this content when possible:\n\n` +
+    ? `\n\nThe student has uploaded the following study materials. Each section is labelled with its page, slide, or heading. Use these as the PRIMARY source — pull directly from this content when possible:\n\n` +
       docs.map((d) =>
-        `--- ${d.name} ---\n${d.content
-          ? getRelevantChunks(d.content, query ?? "", charsEach)
+        `--- ${d.name} ---\n${d.chunks.length > 0
+          ? getRelevantChunks(d.chunks, query ?? "", charsEach)
           : "(No text content could be extracted from this file)"
         }`
       ).join("\n\n") + "\n"
@@ -146,8 +152,8 @@ function buildSystemPrompt(docs: UploadedDoc[], customInstructions?: string, que
 
   const groundingRules = docs.length > 0
     ? `\n\n━━━ SOURCE RULES ━━━
-- Answer using the uploaded study material above as your primary source.
-- If the student asks about something not present in the provided content, say clearly: "That topic isn't in the sections I have access to from your uploaded material." Then offer a brief general nursing answer if helpful.
+- Answer using the uploaded study material above as your primary source. Sections are labelled [Page X], [Slide X], or [Section Name] — reference these labels when relevant (e.g. "According to Page 4...").
+- If the student asks about something not present in the provided sections, say clearly: "That topic isn't in the sections I have access to from your uploaded material." Then offer a brief general nursing answer if helpful.
 - Never invent specific details (drug doses, lab values, procedures) and present them as coming from the uploaded document.
 - If you are drawing on general nursing knowledge rather than the uploaded content, say so briefly.`
     : `\n\n━━━ SOURCE RULES ━━━
@@ -840,8 +846,8 @@ function StudentTutor({ onBack }: { onBack: () => void }) {
       const added: UploadedDoc[] = [];
       for (const file of files) {
         try {
-          const content = await extractText(file);
-          added.push({ name: file.name, content });
+          const chunks = await extractChunks(file);
+          added.push({ name: file.name, chunks });
         } catch {
           setMessages((prev) => [...prev, { id: uid(), role: "assistant", type: "text",
             content: `Sorry, I couldn't read ${file.name}. Try .txt, .md, .pdf, .docx, .pptx, or an image (jpg, png).` }]);
