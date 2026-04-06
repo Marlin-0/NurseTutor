@@ -697,6 +697,7 @@ function StudentTutor({ onBack }: { onBack: () => void }) {
   const [tokenUsage, setTokenUsage] = useState({ last: 0, session: 0 });
   const [uploadedDocs, setUploadedDocs] = useState<UploadedDoc[]>([]);
   const [showFiles, setShowFiles] = useState(false);
+  const [uploadingFile, setUploadingFile] = useState<string | null>(null);
   const [history, setHistory] = useState<ConversationTurn[]>([]);
   const [customInstructions, setCustomInstructions] = useState<string>(
     () => localStorage.getItem("nursetutor-instructions") ?? ""
@@ -845,6 +846,7 @@ function StudentTutor({ onBack }: { onBack: () => void }) {
 
       const added: UploadedDoc[] = [];
       for (const file of files) {
+        setUploadingFile(file.name);
         try {
           const chunks = await extractChunks(file);
           added.push({ name: file.name, chunks });
@@ -853,6 +855,7 @@ function StudentTutor({ onBack }: { onBack: () => void }) {
             content: `Sorry, I couldn't read ${file.name}. Try .txt, .md, .pdf, .docx, .pptx, or an image (jpg, png).` }]);
         }
       }
+      setUploadingFile(null);
 
       if (added.length === 0) return;
 
@@ -941,34 +944,90 @@ function StudentTutor({ onBack }: { onBack: () => void }) {
         </div>
       </div>
 
-      {/* ── File bank panel ── */}
-      {showFiles && (
-        <div className="shrink-0 border-b border-border bg-muted/30 px-5 py-3 space-y-2">
+      {/* ── Upload loading bar ── */}
+      {uploadingFile && (
+        <div className="shrink-0 border-b border-brand-200 bg-brand-50 px-5 py-2 space-y-1.5">
           <div className="flex items-center justify-between">
-            <p className="text-xs font-semibold text-foreground">Uploaded files</p>
-            <button
-              onClick={() => setUploadedDocs([])}
-              className="text-xs text-red-500 hover:text-red-600 transition-colors"
-            >
-              Remove all
-            </button>
+            <p className="text-xs text-brand-700 font-medium truncate max-w-xs">
+              Extracting: {uploadingFile}
+            </p>
+            <p className="text-xs text-brand-500 shrink-0 ml-2">processing…</p>
           </div>
-          <div className="space-y-1.5">
-            {[...uploadedDocs].sort((a, b) => a.name.localeCompare(b.name)).map(doc => (
-              <div key={doc.name} className="flex items-center gap-2 text-xs bg-background border border-border rounded-lg px-3 py-2">
-                <span className="text-base">📄</span>
-                <span className="flex-1 truncate text-foreground font-medium">{doc.name}</span>
-                <button
-                  onClick={() => setUploadedDocs(prev => prev.filter(d => d.name !== doc.name))}
-                  className="text-muted-foreground hover:text-red-500 transition-colors"
-                >
-                  ✕
-                </button>
-              </div>
-            ))}
+          <div className="h-1.5 w-full bg-brand-100 rounded-full overflow-hidden">
+            <div className="h-full bg-brand-500 rounded-full animate-pulse w-full" />
           </div>
         </div>
       )}
+
+      {/* ── File bank panel ── */}
+      {showFiles && (() => {
+        // Estimate storage usage
+        const STORAGE_LIMIT_KB = 5120; // 5MB in KB
+        let usedKB = 0;
+        try {
+          for (const key in localStorage) {
+            if (Object.prototype.hasOwnProperty.call(localStorage, key)) {
+              usedKB += (localStorage.getItem(key)?.length ?? 0) * 2 / 1024;
+            }
+          }
+        } catch {}
+        const usedPct = Math.min(100, Math.round((usedKB / STORAGE_LIMIT_KB) * 100));
+        const storageColor = usedPct > 80 ? "bg-red-500" : usedPct > 55 ? "bg-amber-400" : "bg-emerald-500";
+        const storageText = usedPct > 80 ? "text-red-600" : usedPct > 55 ? "text-amber-600" : "text-emerald-600";
+
+        return (
+          <div className="shrink-0 border-b border-border bg-muted/30 px-5 py-3 space-y-2">
+            <div className="flex items-center justify-between">
+              <p className="text-xs font-semibold text-foreground">Uploaded files</p>
+              <button
+                onClick={() => setUploadedDocs([])}
+                className="text-xs text-red-500 hover:text-red-600 transition-colors"
+              >
+                Remove all
+              </button>
+            </div>
+            <div className="space-y-1.5">
+              {[...uploadedDocs].sort((a, b) => a.name.localeCompare(b.name)).map(doc => (
+                <div key={doc.name} className="flex items-center gap-2 text-xs bg-background border border-border rounded-lg px-3 py-2">
+                  <span className="text-base">📄</span>
+                  <span className="flex-1 truncate text-foreground font-medium">{doc.name}</span>
+                  <span className="shrink-0 text-muted-foreground">
+                    {doc.chunks.length} {doc.chunks.length === 1 ? "section" : "sections"}
+                  </span>
+                  <button
+                    onClick={() => setUploadedDocs(prev => prev.filter(d => d.name !== doc.name))}
+                    className="text-muted-foreground hover:text-red-500 transition-colors"
+                  >
+                    ✕
+                  </button>
+                </div>
+              ))}
+            </div>
+
+            {/* Storage bar */}
+            <div className="pt-1 space-y-1">
+              <div className="flex items-center justify-between">
+                <p className="text-[10px] text-muted-foreground font-medium">Browser storage</p>
+                <p className={cn("text-[10px] font-semibold", storageText)}>
+                  {usedKB < 1024
+                    ? `${Math.round(usedKB)} KB`
+                    : `${(usedKB / 1024).toFixed(1)} MB`
+                  } / 5 MB
+                </p>
+              </div>
+              <div className="h-1.5 w-full bg-muted rounded-full overflow-hidden">
+                <div
+                  className={cn("h-full rounded-full transition-all", storageColor)}
+                  style={{ width: `${usedPct}%` }}
+                />
+              </div>
+              {usedPct > 80 && (
+                <p className="text-[10px] text-red-500">Storage almost full — remove some files to free space.</p>
+              )}
+            </div>
+          </div>
+        );
+      })()}
 
       {/* ── Custom instructions panel ── */}
       {showInstructions && (
