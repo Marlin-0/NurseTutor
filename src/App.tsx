@@ -82,9 +82,9 @@ function savePool(pool: PooledChunk[]): void {
 const QUICK_ACTIONS = [
   { label: "Explain a topic", prompt: "Explain a topic from my uploaded material in detail, with clinical context" },
   { label: "Summarize material", prompt: "Give me a concise summary of the key topics covered in my uploaded material" },
-  { label: "MCQ quiz", prompt: "Give me a hard MCQ clinical nursing question based on my uploaded material" },
-  { label: "SATA quiz", prompt: "Give me a SATA nursing question based on my uploaded material" },
-  { label: "Case scenario", prompt: "Give me a clinical nursing case scenario based on my uploaded material" },
+  { label: "MCQ quiz", prompt: "Give me a hard MCQ clinical nursing question" },
+  { label: "SATA quiz", prompt: "Give me a SATA nursing question" },
+  { label: "Case scenario", prompt: "Give me a clinical nursing case scenario" },
 ];
 
 // ─── Keyword retrieval ────────────────────────────────────────────────────────
