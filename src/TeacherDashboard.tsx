@@ -96,8 +96,6 @@ function makeInfoTab(id: string, label: string, content: string): CourseTab {
 // ─── API ──────────────────────────────────────────────────────────────────────
 
 async function parseSyllabus(text: string): Promise<ParsedSyllabus> {
-  const apiKey = import.meta.env.VITE_GROQ_API_KEY as string;
-
   const system = `You are an expert at parsing academic course syllabi. Extract structured information and return ONLY valid JSON — no markdown, no code fences, no extra text.
 
 Return exactly this JSON shape:
@@ -116,12 +114,9 @@ Rules:
 - learning_outcomes should be concise bullet-style phrases.
 - Output ONLY the JSON object. Nothing else.`;
 
-  const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+  const res = await fetch("/api/chat", {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${apiKey}`,
-    },
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       model: "llama-3.3-70b-versatile",
       max_tokens: 4096,
@@ -143,7 +138,6 @@ async function generateQuestionBank(
   files: TabFile[],
   tabLabel: string
 ): Promise<ParsedQuestion[]> {
-  const apiKey = import.meta.env.VITE_GROQ_API_KEY as string;
   const combinedContent = files.map((f) => `--- ${f.name} ---\n${f.content}`).join("\n\n");
 
   const system = `You are NurseTutor, an expert nursing educator creating exam questions for a professor.
@@ -181,12 +175,9 @@ Output ONLY the questions in this format. No preamble, no summary, no extra text
     "(No files uploaded — generate general NCLEX-level nursing questions appropriate for this week of a nursing course)"
   }`;
 
-  const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+  const res = await fetch("/api/chat", {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${apiKey}`,
-    },
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       model: "llama-3.3-70b-versatile",
       max_tokens: 4096,

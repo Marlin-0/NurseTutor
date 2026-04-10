@@ -5,7 +5,7 @@ import { Input } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { cn } from "@/lib/utils";
 import TeacherDashboard from "./TeacherDashboard";
-import { extractChunks, DocChunk } from "./lib/parseFile";
+import { extractChunks, type ProgressCallback } from "./lib/parseFile";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -48,18 +48,43 @@ interface ConversationTurn {
   content: string;
 }
 
+/** Entry in the shared localStorage chunk pool */
+interface PooledChunk {
+  source: string;  // originating filename
+  label: string;   // "Page 3", "Slide 7", "Section: Cardiac Meds"
+  text: string;
+}
+
+/** Lightweight display record — full chunks live in the pool */
 interface UploadedDoc {
   name: string;
-  chunks: DocChunk[];
+  count: number; // number of chunks contributed to the pool
+}
+
+// ─── Chunk pool (localStorage) ────────────────────────────────────────────────
+
+const POOL_KEY = "nursetutor-chunk-pool";
+
+function loadPool(): PooledChunk[] {
+  try {
+    return JSON.parse(localStorage.getItem(POOL_KEY) ?? "[]");
+  } catch {
+    return [];
+  }
+}
+
+function savePool(pool: PooledChunk[]): void {
+  localStorage.setItem(POOL_KEY, JSON.stringify(pool));
 }
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 const QUICK_ACTIONS = [
-  { label: "MCQ quiz", prompt: "Give me a hard MCQ clinical nursing question" },
-  { label: "SATA quiz", prompt: "Give me a SATA nursing question" },
-  { label: "Explain topic", prompt: "Explain a core nursing concept for NCLEX" },
-  { label: "Case scenario", prompt: "Give me a clinical nursing case scenario" },
+  { label: "Explain a topic", prompt: "Explain a topic from my uploaded material in detail, with clinical context" },
+  { label: "Summarize material", prompt: "Give me a concise summary of the key topics covered in my uploaded material" },
+  { label: "MCQ quiz", prompt: "Give me a hard MCQ clinical nursing question based on my uploaded material" },
+  { label: "SATA quiz", prompt: "Give me a SATA nursing question based on my uploaded material" },
+  { label: "Case scenario", prompt: "Give me a clinical nursing case scenario based on my uploaded material" },
 ];
 
 // ─── Keyword retrieval ────────────────────────────────────────────────────────
@@ -78,94 +103,93 @@ function queryKeywords(text: string): Set<string> {
     text.toLowerCase()
       .replace(/[^\w\s]/g, " ")
       .split(/\s+/)
-      .filter((w) => w.length > 3 && !STOP_WORDS.has(w))
+      .filter((w) => w.length > 0 && !STOP_WORDS.has(w) && (w.length > 3 || /^\d+$/.test(w)))
   );
 }
 
-function scoreChunk(chunk: DocChunk, keywords: Set<string>): number {
-  const words = queryKeywords(chunk.text);
+// Top-K chunks from the shared pool, each capped at CHUNK_CHAR_CAP characters
+const TOP_K = 4;
+const CHUNK_CHAR_CAP = 700;
+
+function scoreChunk(chunk: PooledChunk, keywords: Set<string>): number {
+  const bodyWords = queryKeywords(chunk.text);
   const labelWords = queryKeywords(chunk.label);
+  // Also score against the source filename — e.g. "cardiac" in "cardiac_meds.pdf"
+  const sourceWords = queryKeywords(chunk.source);
   let score = 0;
   for (const kw of keywords) {
-    // Label matches score higher — a heading match is very strong signal
-    if (labelWords.has(kw)) score += 3;
-    else if ([...labelWords].some((w) => w.startsWith(kw) || kw.startsWith(w))) score += 1.5;
-    // Body matches
-    if (words.has(kw)) score += 1;
-    else if ([...words].some((w) => w.startsWith(kw) || kw.startsWith(w))) score += 0.5;
+    if (labelWords.has(kw)) {
+      // Exact number matches (e.g. "77" in "Page 77") score highest
+      score += /^\d+$/.test(kw) ? 10 : 3;
+    } else if ([...labelWords].some((w) => w.startsWith(kw) || kw.startsWith(w))) {
+      score += 1.5;
+    }
+    if (sourceWords.has(kw)) score += 1;
+    if (bodyWords.has(kw)) score += 1;
+    else if ([...bodyWords].some((w) => w.startsWith(kw) || kw.startsWith(w))) score += 0.5;
   }
   return score;
 }
 
-function getRelevantChunks(chunks: DocChunk[], query: string, budget: number): string {
-  if (chunks.length === 0) return "";
+function getRelevantChunks(pool: PooledChunk[], query: string): string {
+  if (pool.length === 0) return "";
 
-  const fullText = chunks.map((c) => `[${c.label}]\n${c.text}`).join("\n\n");
+  let selected: PooledChunk[];
 
-  // If everything fits, return it all
-  if (fullText.length <= budget) return fullText;
-
-  // No query — return first N chars
-  if (!query.trim()) return fullText.slice(0, budget);
-
-  const keywords = queryKeywords(query);
-  if (keywords.size === 0) return fullText.slice(0, budget);
-
-  // Score every chunk, sort best-first, pack into budget
-  const scored = chunks
-    .map((chunk) => ({ chunk, score: scoreChunk(chunk, keywords) }))
-    .sort((a, b) => b.score - a.score);
-
-  let result = "";
-  for (const { chunk } of scored) {
-    const entry = `[${chunk.label}]\n${chunk.text}\n\n`;
-    if (result.length + entry.length > budget) break;
-    result += entry;
+  if (!query.trim()) {
+    selected = pool.slice(0, TOP_K);
+  } else {
+    const keywords = queryKeywords(query);
+    if (keywords.size === 0) {
+      selected = pool.slice(0, TOP_K);
+    } else {
+      selected = pool
+        .map((chunk) => ({ chunk, score: scoreChunk(chunk, keywords) }))
+        .sort((a, b) => b.score - a.score)
+        .slice(0, TOP_K)
+        .map(({ chunk }) => chunk);
+    }
   }
 
-  // Fallback: nothing fit, use beginning
-  return result.trim() || fullText.slice(0, budget);
+  return selected
+    .map((c) => `[${c.source} — ${c.label}]\n${c.text.slice(0, CHUNK_CHAR_CAP)}`)
+    .join("\n\n");
 }
 
 // ─── System prompt ────────────────────────────────────────────────────────────
 
-function buildSystemPrompt(docs: UploadedDoc[], customInstructions?: string, query?: string): string {
-  const TOTAL_CHAR_BUDGET = 6000;
-  // Guard: docs uploaded before the chunks refactor may lack the chunks field
-  const safeDocs = docs.map((d) => ({
-    ...d,
-    chunks: Array.isArray(d.chunks) ? d.chunks : [],
-  }));
-  const docsWithChunks = safeDocs.filter((d) => d.chunks.length > 0);
-  const charsEach = docsWithChunks.length > 0
-    ? Math.floor(TOTAL_CHAR_BUDGET / docsWithChunks.length)
-    : TOTAL_CHAR_BUDGET;
+function buildSystemPrompt(customInstructions?: string, query?: string): string {
+  const pool = loadPool();
+  const hasFiles = pool.length > 0;
 
-  const docContext = safeDocs.length > 0
-    ? `\n\nThe student has uploaded the following study materials. Each section is labelled with its page, slide, or heading. Use these as the PRIMARY source — pull directly from this content when possible:\n\n` +
-      safeDocs.map((d) =>
-        `--- ${d.name} ---\n${d.chunks.length > 0
-          ? getRelevantChunks(d.chunks, query ?? "", charsEach)
-          : "(No text content could be extracted from this file)"
-        }`
-      ).join("\n\n") + "\n"
+  const docContext = hasFiles
+    ? `\n\nThe student has uploaded study materials. The 4 most relevant sections across all uploaded files are shown below. Use these as the PRIMARY source:\n\n` +
+      getRelevantChunks(pool, query ?? "") + "\n"
     : "";
 
   const customContext = customInstructions?.trim()
     ? `\n\n━━━ CUSTOM INSTRUCTIONS FROM STUDENT ━━━\n${customInstructions.trim()}\nAlways follow the above instructions for every response.\n`
     : "";
 
-  const groundingRules = safeDocs.length > 0
+  const groundingRules = hasFiles
     ? `\n\n━━━ SOURCE RULES ━━━
-- Answer using the uploaded study material above as your primary source. Sections are labelled [Page X], [Slide X], or [Section Name] — reference these labels when relevant (e.g. "According to Page 4...").
-- If the student asks about something not present in the provided sections, say clearly: "That topic isn't in the sections I have access to from your uploaded material." Then offer a brief general nursing answer if helpful.
+- Answer using the uploaded study material above as your primary source. Reference the section label when relevant (e.g. "According to Slide 5..." or "From Page 3 of cardiac_meds.pdf...").
+- If the student asks about something not covered in the provided sections, say clearly: "That topic isn't in the sections I can see from your uploaded material." Then offer a brief general nursing answer if helpful.
 - Never invent specific details (drug doses, lab values, procedures) and present them as coming from the uploaded document.
 - If you are drawing on general nursing knowledge rather than the uploaded content, say so briefly.`
     : `\n\n━━━ SOURCE RULES ━━━
 - No study materials are uploaded. Make this clear if the student asks about a specific document or course material: tell them to upload the file first.
 - Your answers draw from general nursing and NCLEX knowledge only — do not imply you have seen their specific course content.`;
 
-  return `You are NurseTutor, a rigorous and expert nursing tutor helping students prepare for NCLEX and clinical practice. You write challenging, clinically-grounded questions that mirror real patient care situations.${docContext}${customContext}${groundingRules}
+  return `You are NurseTutor, a nursing classroom assistant. Your primary role is to help students understand course material — explain topics, answer questions about uploaded content, and summarize key concepts. You also generate challenging NCLEX-style practice questions when asked.${docContext}${customContext}${groundingRules}
+
+━━━ EXPLANATION MODE ━━━
+When a student asks you to explain a topic, summarize material, or asks a question about course content:
+- Draw directly from the uploaded study material above. Reference specific sections, pages, or slides by name.
+- Structure your explanation clearly: start with the core concept, explain the clinical relevance, then highlight key details the student should remember.
+- Use bullet points, numbered steps, or short paragraphs — whichever best fits the content.
+- If the topic spans multiple sections of the uploaded material, synthesize across them.
+- End with 1–2 sentences on why this is clinically important or likely to appear on NCLEX.
 
 ━━━ QUIZ PHILOSOPHY ━━━
 - Questions MUST be clinical and scenario-based — always describe a real patient (age, chief complaint, relevant vitals/labs/history). Never ask pure recall questions like "What is the normal range of X?"
@@ -221,29 +245,32 @@ interface GroqResponse {
 
 async function callGroq(
   history: ConversationTurn[],
-  docs: UploadedDoc[],
-  customInstructions?: string
+  customInstructions?: string,
+  attempt = 0
 ): Promise<GroqResponse> {
-  const apiKey = import.meta.env.VITE_GROQ_API_KEY as string;
-
-  // Use the last user message as the retrieval query
   const lastUserMsg = [...history].reverse().find((t) => t.role === "user")?.content ?? "";
 
-  const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+  const res = await fetch("/api/chat", {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Authorization": `Bearer ${apiKey}`,
-    },
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       model: "llama-3.1-8b-instant",
       max_tokens: 4000,
       messages: [
-        { role: "system", content: buildSystemPrompt(docs, customInstructions, lastUserMsg) },
-        ...history.slice(-2).map((turn) => ({ role: turn.role, content: turn.content.slice(0, 2000) })),
+        { role: "system", content: buildSystemPrompt(customInstructions, lastUserMsg) },
+        ...history.slice(-2).map((turn) => ({ role: turn.role, content: turn.content.slice(0, 1000) })),
       ],
     }),
   });
+
+  if (res.status === 429 && attempt < 3) {
+    // Wait exactly as long as Groq asks, then retry — never fires multiple requests at once
+    const retryAfterSec = parseFloat(res.headers.get("retry-after") ?? "");
+    const waitMs = (Number.isFinite(retryAfterSec) ? retryAfterSec * 1000 : 15000) + 1000;
+    await new Promise((r) => setTimeout(r, waitMs));
+    return callGroq(history, customInstructions, attempt + 1);
+  }
+
   if (!res.ok) throw new Error(`API error ${res.status}`);
   const data = await res.json();
   return {
@@ -703,6 +730,7 @@ function StudentTutor({ onBack }: { onBack: () => void }) {
   const [uploadedDocs, setUploadedDocs] = useState<UploadedDoc[]>([]);
   const [showFiles, setShowFiles] = useState(false);
   const [uploadingFile, setUploadingFile] = useState<string | null>(null);
+  const [uploadProgress, setUploadProgress] = useState<{ message: string; pct: number } | null>(null);
   const [history, setHistory] = useState<ConversationTurn[]>([]);
   const [customInstructions, setCustomInstructions] = useState<string>(
     () => localStorage.getItem("nursetutor-instructions") ?? ""
@@ -722,13 +750,29 @@ function StudentTutor({ onBack }: { onBack: () => void }) {
     (m): m is MCQMessage | SATAMessage => m.role === "assistant" && (m.type === "mcq" || m.type === "sata")
   );
 
-  // Go to the first question of the new batch and expand the navigator when questions arrive
+  // When new questions arrive, jump to the oldest unanswered question
   useEffect(() => {
-    if (questionMessages.length > 0) {
-      setQuestionIndex(0);
-      setQuestionMinimized(false);
-    }
+    if (questionMessages.length === 0) return;
+    const firstUnanswered = questionMessages.findIndex(
+      (m) => (m.type === "mcq" && m.chosen === undefined) ||
+              (m.type === "sata" && !m.submitted)
+    );
+    setQuestionIndex(firstUnanswered >= 0 ? firstUnanswered : questionMessages.length - 1);
+    setQuestionMinimized(false);
   }, [questionMessages.length]);
+
+  // Restore uploaded doc list from the pool on mount
+  useEffect(() => {
+    const pool = loadPool();
+    if (pool.length === 0) return;
+    const sourceMap = new Map<string, number>();
+    for (const c of pool) {
+      sourceMap.set(c.source, (sourceMap.get(c.source) ?? 0) + 1);
+    }
+    setUploadedDocs(
+      [...sourceMap.entries()].map(([name, count]) => ({ name, count }))
+    );
+  }, []);
 
   useEffect(() => {
     const welcome: TextMessage = {
@@ -736,7 +780,7 @@ function StudentTutor({ onBack }: { onBack: () => void }) {
       role: "assistant",
       type: "text",
       content:
-        "Welcome! I'm NurseTutor — your clinical study companion.\n\nUpload your notes or slides and I'll generate questions straight from your material. Otherwise, use the quick actions below or just ask me anything!\n\nTip: To get the most out of your questions, I recommend setting your preferences through the Instructions button in the top right — you can tell me your focus area, difficulty level, or anything else that helps me tailor to you.",
+        "Welcome! I'm NurseTutor — your nursing classroom assistant.\n\nUpload your course notes, slides, or textbook chapters and I can:\n• Explain any topic from your material\n• Answer questions about course content\n• Summarize key concepts\n• Generate NCLEX-style practice questions (MCQ & SATA)\n\nUse the quick actions below, or just ask me anything!\n\nTip: Use the Instructions button in the top right to set your focus area, difficulty level, or any other preferences.",
     };
     setMessages([welcome]);
   }, []);
@@ -762,7 +806,7 @@ function StudentTutor({ onBack }: { onBack: () => void }) {
       setLoading(true);
 
       try {
-        const { content: raw, usage } = await callGroq(newHistory, uploadedDocs, customInstructions);
+        const { content: raw, usage } = await callGroq(newHistory, customInstructions);
         setTokenUsage(prev => ({ last: usage.total_tokens, session: prev.session + usage.total_tokens }));
         setHistory((h) => [...h, { role: "assistant", content: raw }]);
 
@@ -793,7 +837,7 @@ function StudentTutor({ onBack }: { onBack: () => void }) {
         setLoading(false);
       }
     },
-    [loading, history, uploadedDocs, customInstructions]
+    [loading, history, customInstructions]
   );
 
   const answerMCQ = useCallback(
@@ -851,17 +895,32 @@ function StudentTutor({ onBack }: { onBack: () => void }) {
       e.target.value = "";
 
       const added: UploadedDoc[] = [];
+      let ocrFailCount = 0;
       for (const file of files) {
         setUploadingFile(file.name);
+        setUploadProgress(null);
+        const onProgress: ProgressCallback = (message, current, total, warn) => {
+          setUploadProgress({ message, pct: Math.round((current / total) * 100) });
+          if (warn) ocrFailCount++;
+        };
         try {
-          const chunks = await extractChunks(file);
-          added.push({ name: file.name, chunks });
+          const chunks = await extractChunks(file, onProgress);
+          // Merge into the shared pool, replacing any existing entry for this file
+          const pooled: PooledChunk[] = chunks.map((c) => ({
+            source: file.name,
+            label: c.label,
+            text: c.text,
+          }));
+          const pool = loadPool();
+          savePool([...pool.filter((c) => c.source !== file.name), ...pooled]);
+          added.push({ name: file.name, count: chunks.length });
         } catch {
           setMessages((prev) => [...prev, { id: uid(), role: "assistant", type: "text",
             content: `Sorry, I couldn't read ${file.name}. Try .txt, .md, .pdf, .docx, .pptx, or an image (jpg, png).` }]);
         }
       }
       setUploadingFile(null);
+      setUploadProgress(null);
 
       if (added.length === 0) return;
 
@@ -871,8 +930,15 @@ function StudentTutor({ onBack }: { onBack: () => void }) {
       });
 
       const names = added.map(d => d.name).join(", ");
-      setMessages((prev) => [...prev, { id: uid(), role: "assistant", type: "text",
-        content: `Got it — I've added ${names} to your file bank. I'll draw on all your uploaded files when generating questions. Want me to quiz you, explain a concept, or work through a case?` }]);
+      const msgs: Message[] = [
+        { id: uid(), role: "assistant", type: "text",
+          content: `Got it — I've added ${names} to your file bank. I'll draw on all your uploaded files when generating questions. Want me to quiz you, explain a concept, or work through a case?` },
+      ];
+      if (ocrFailCount > 0) {
+        msgs.push({ id: uid(), role: "assistant", type: "text",
+          content: `⚠️ Heads up: OCR couldn't process ${ocrFailCount} page${ocrFailCount !== 1 ? "s" : ""} — those fell back to basic text extraction, which may be limited. This usually means the image was too large or a rate limit was hit. You can re-upload the file to retry.` });
+      }
+      setMessages((prev) => [...prev, ...msgs]);
     },
     []
   );
@@ -955,12 +1021,23 @@ function StudentTutor({ onBack }: { onBack: () => void }) {
         <div className="shrink-0 border-b border-brand-200 bg-brand-50 px-5 py-2 space-y-1.5">
           <div className="flex items-center justify-between">
             <p className="text-xs text-brand-700 font-medium truncate max-w-xs">
-              Extracting: {uploadingFile}
+              {uploadingFile}
             </p>
-            <p className="text-xs text-brand-500 shrink-0 ml-2">processing…</p>
+            <p className="text-xs text-brand-500 shrink-0 ml-2">
+              {uploadProgress ? `${uploadProgress.pct}%` : "reading…"}
+            </p>
           </div>
+          {uploadProgress && (
+            <p className="text-xs text-brand-600 truncate">{uploadProgress.message}</p>
+          )}
           <div className="h-1.5 w-full bg-brand-100 rounded-full overflow-hidden">
-            <div className="h-full bg-brand-500 rounded-full animate-pulse w-full" />
+            <div
+              className={cn(
+                "h-full bg-brand-500 rounded-full transition-all duration-300",
+                !uploadProgress && "animate-pulse w-full"
+              )}
+              style={{ width: uploadProgress ? `${uploadProgress.pct}%` : undefined }}
+            />
           </div>
         </div>
       )}
@@ -986,7 +1063,7 @@ function StudentTutor({ onBack }: { onBack: () => void }) {
             <div className="flex items-center justify-between">
               <p className="text-xs font-semibold text-foreground">Uploaded files</p>
               <button
-                onClick={() => setUploadedDocs([])}
+                onClick={() => { savePool([]); setUploadedDocs([]); }}
                 className="text-xs text-red-500 hover:text-red-600 transition-colors"
               >
                 Remove all
@@ -998,10 +1075,13 @@ function StudentTutor({ onBack }: { onBack: () => void }) {
                   <span className="text-base">📄</span>
                   <span className="flex-1 truncate text-foreground font-medium">{doc.name}</span>
                   <span className="shrink-0 text-muted-foreground">
-                    {doc.chunks.length} {doc.chunks.length === 1 ? "section" : "sections"}
+                    {doc.count} {doc.count === 1 ? "section" : "sections"}
                   </span>
                   <button
-                    onClick={() => setUploadedDocs(prev => prev.filter(d => d.name !== doc.name))}
+                    onClick={() => {
+                      savePool(loadPool().filter((c) => c.source !== doc.name));
+                      setUploadedDocs(prev => prev.filter(d => d.name !== doc.name));
+                    }}
                     className="text-muted-foreground hover:text-red-500 transition-colors"
                   >
                     ✕
