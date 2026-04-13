@@ -251,12 +251,25 @@ Rules:
 
 async function generateQuestionBank(
   files: TabFile[],
-  tabLabel: string
+  tabLabel: string,
+  teacherInstructions?: string
 ): Promise<ParsedQuestion[]> {
   const combinedContent = files.map((f) => `--- ${f.name} ---\n${f.content}`).join("\n\n");
 
+  const customSection = teacherInstructions?.trim()
+    ? `\n\n━━━ INSTRUCTOR INSTRUCTIONS ━━━\n${teacherInstructions.trim()}\nApply these instructions to every question generated.\n`
+    : "";
+
   const system = `You are NurseTutor, an expert nursing educator creating exam questions for a professor.
-Generate 10-15 nursing questions (mix of MCQ and SATA). All must be clinical and scenario-based.
+Generate 10-15 nursing questions (mix of MCQ and SATA). All must be clinical and scenario-based.${customSection}
+
+DIFFICULTY & QUALITY RULES:
+- Write at application and analysis level (NCLEX Next Generation style) — not recall/definition.
+- Scenarios must include relevant clinical data: vitals, labs, medications, timeline.
+- Distractors must be highly plausible — use common clinical misconceptions, look-alike drugs, or values close to normal limits. Never use obviously wrong options.
+- CRITICAL: Distribute correct answers evenly across positions. Do NOT default to A or B. Across the set, spread answers across A, B, C, and D roughly equally. For any given question, the correct answer position must feel unpredictable.
+- For SATA: 2–4 correct answers; incorrect options should represent common clinical errors.
+- Include a mix of: priority/triage questions, pharmacology (dosing, interactions, patient teaching), assessment findings, and nursing interventions.
 
 For EACH question use EXACTLY this format, separated by lines containing only ---:
 
@@ -458,6 +471,11 @@ export default function TeacherDashboard({ onBack }: { onBack: () => void }) {
   const [locked, setLocked] = useState(false);
   const [confirmClear, setConfirmClear] = useState(false);
   const [fileUploading, setFileUploading] = useState(false);
+  const [teacherInstructions, setTeacherInstructions] = useState<string>(
+    () => localStorage.getItem("nursetutor-teacher-instructions") ?? ""
+  );
+  const [showInstructions, setShowInstructions] = useState(false);
+  const [draftInstructions, setDraftInstructions] = useState("");
   const fileInputRef = useRef<HTMLInputElement>(null);
   const syllabusInputRef = useRef<HTMLInputElement>(null);
 
@@ -703,7 +721,7 @@ export default function TeacherDashboard({ onBack }: { onBack: () => void }) {
     if (!activeTab) return;
     updateTab(activeTabId, { loading: true, error: "" });
     try {
-      const questions = await generateQuestionBank(activeTab.files, activeTab.label);
+      const questions = await generateQuestionBank(activeTab.files, activeTab.label, teacherInstructions);
       updateTab(activeTabId, { questions, loading: false });
     } catch {
       updateTab(activeTabId, { loading: false, error: "Failed to generate questions. Please try again." });
@@ -781,6 +799,18 @@ export default function TeacherDashboard({ onBack }: { onBack: () => void }) {
           </button>
           <input ref={syllabusInputRef} type="file" accept=".txt,.md,.docx,.pdf,.pptx,.png,.jpg,.jpeg,.webp,.gif" className="hidden" onChange={handleSyllabusUpload} />
           <button
+            onClick={() => { setDraftInstructions(teacherInstructions); setShowInstructions((v) => !v); }}
+            title="Custom instructions for question generation"
+            className={cn(
+              "text-xs border rounded-lg px-3 h-8 transition-all font-medium",
+              teacherInstructions
+                ? "border-brand-400 text-brand-600 bg-brand-50"
+                : "border-border text-muted-foreground hover:text-foreground"
+            )}
+          >
+            {teacherInstructions ? "⚙ Prompt ●" : "⚙ Prompt"}
+          </button>
+          <button
             onClick={() => setLocked((v) => !v)}
             title={locked ? "Unlock editing" : "Lock — prevent accidental edits"}
             className={cn(
@@ -800,6 +830,52 @@ export default function TeacherDashboard({ onBack }: { onBack: () => void }) {
           </button>
         </div>
       </header>
+
+      {/* ── Prompt instructions panel ── */}
+      {showInstructions && (
+        <div className="shrink-0 border-b border-border bg-brand-50/50 px-5 py-3 space-y-2">
+          <p className="text-xs font-semibold text-brand-700">Question generation instructions</p>
+          <p className="text-xs text-muted-foreground">
+            Customise every question bank generated — e.g. "Focus on pharmacology and drug calculations", "Include delegation and priority questions", "Use Canadian drug names", "Make questions harder with ambiguous distractors". Applied until cleared.
+          </p>
+          <textarea
+            value={draftInstructions}
+            onChange={(e) => setDraftInstructions(e.target.value)}
+            placeholder="e.g. Focus on critical care — include ventilator settings, vasopressors, and haemodynamic monitoring…"
+            rows={3}
+            className="w-full text-sm rounded-lg border border-border bg-background px-3 py-2 resize-none focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-400 placeholder:text-muted-foreground"
+          />
+          <div className="flex gap-2">
+            <button
+              className="text-xs bg-brand-500 hover:bg-brand-600 text-white rounded-lg px-3 h-8 font-semibold transition-all"
+              onClick={() => {
+                setTeacherInstructions(draftInstructions);
+                localStorage.setItem("nursetutor-teacher-instructions", draftInstructions);
+                setShowInstructions(false);
+              }}
+            >
+              Save
+            </button>
+            <button
+              className="text-xs border border-border rounded-lg px-3 h-8 text-muted-foreground hover:text-foreground transition-all"
+              onClick={() => {
+                setDraftInstructions("");
+                setTeacherInstructions("");
+                localStorage.removeItem("nursetutor-teacher-instructions");
+                setShowInstructions(false);
+              }}
+            >
+              Clear
+            </button>
+            <button
+              className="text-xs text-muted-foreground hover:text-foreground px-2 ml-auto"
+              onClick={() => setShowInstructions(false)}
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* ── Banners ── */}
       {syllabusError && (
