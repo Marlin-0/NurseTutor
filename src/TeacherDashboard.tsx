@@ -200,7 +200,7 @@ async function parseSyllabus(text: string): Promise<ParsedSyllabus> {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       model: "llama-3.3-70b-versatile",
-      max_tokens: 8192,
+      max_tokens: 4096,
       messages: [
         {
           role: "system",
@@ -244,7 +244,7 @@ Rules you must follow:
         },
         {
           role: "user",
-          content: `Parse this nursing course syllabus and return the JSON object:\n\n${text.slice(0, 14000)}`,
+          content: `Parse this nursing course syllabus and return the JSON object:\n\n${text.slice(0, 20000)}`,
         },
       ],
     }),
