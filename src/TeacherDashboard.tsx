@@ -3,7 +3,6 @@ import { extractText } from "./lib/parseFile";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { cn } from "@/lib/utils";
-import type { SyllabusChunk, ParsedSyllabusV2, ExamEntry, GradeComponent } from "./lib/syllabusTypes";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -37,6 +36,17 @@ interface CourseTab {
   content?: string;
 }
 
+interface ParsedSyllabus {
+  course_overview: string;
+  office_hours: string;
+  grading_policy: string;
+  weekly_topics: Array<{
+    week: number;
+    topic: string;
+    learning_outcomes: string[];
+  }>;
+}
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 function uid() {
@@ -45,16 +55,6 @@ function uid() {
 
 const STORAGE_KEY = "nursetutor-teacher-v1";
 const PUBLISHED_KEY = "nursetutor-published-pool";
-const SYLLABUS_KEY = "nursetutor-syllabus-pool";
-
-// ─── Syllabus pool helpers ────────────────────────────────────────────────────
-
-function saveSyllabusPool(chunks: SyllabusChunk[]): void {
-  localStorage.setItem(SYLLABUS_KEY, JSON.stringify(chunks));
-}
-function clearSyllabusPool(): void {
-  localStorage.removeItem(SYLLABUS_KEY);
-}
 
 // ─── Published pool helpers ───────────────────────────────────────────────────
 
@@ -184,147 +184,10 @@ function makeInfoTab(id: string, label: string, content: string): CourseTab {
 
 // ─── API ──────────────────────────────────────────────────────────────────────
 
-// ─── Weight normalizer (handles LLM returning 25, "25%", or 0.25) ────────────
+async function parseSyllabus(text: string): Promise<ParsedSyllabus> {
+  const syllabusText = text.slice(0, 16000);
 
-function normalizeWeight(raw: unknown): number | undefined {
-  if (raw == null) return undefined;
-  const n = typeof raw === "string" ? parseFloat((raw as string).replace("%", "")) : Number(raw);
-  if (!isFinite(n)) return undefined;
-  return n > 1 ? n / 100 : n;
-}
-
-// ─── Syllabus → SyllabusChunk[] ───────────────────────────────────────────────
-
-const SYLLABUS_CHUNK_CAP = 700;
-
-function syllabusToChunks(parsed: ParsedSyllabusV2): SyllabusChunk[] {
-  const chunks: SyllabusChunk[] = [];
-  const cap = SYLLABUS_CHUNK_CAP;
-
-  // ── Course info ─────────────────────────────────────────────────────────────
-  const infoText = [
-    parsed.course_name,
-    parsed.course_number ? `Course: ${parsed.course_number}` : null,
-    parsed.instructor_name ? `Instructor: ${parsed.instructor_name}` : null,
-    parsed.instructor_email ? `Email: ${parsed.instructor_email}` : null,
-    parsed.office_hours ? `Office Hours: ${parsed.office_hours}` : null,
-    "",
-    parsed.course_description,
-  ].filter((l) => l !== null).join("\n");
-
-  chunks.push({
-    source: "syllabus",
-    label: "Course Overview",
-    text: infoText.slice(0, cap),
-    meta: { section: "course_info" },
-  });
-
-  // ── Learning objectives ──────────────────────────────────────────────────────
-  if (parsed.learning_objectives.length > 0) {
-    chunks.push({
-      source: "syllabus",
-      label: "Course Learning Objectives",
-      text: parsed.learning_objectives.map((o, i) => `${i + 1}. ${o}`).join("\n").slice(0, cap),
-      meta: { section: "learning_objectives" },
-    });
-  }
-
-  // ── Policies ─────────────────────────────────────────────────────────────────
-  const policyParts = [
-    parsed.attendance_policy ? `Attendance Policy:\n${parsed.attendance_policy}` : null,
-    parsed.late_work_policy ? `Late Work Policy:\n${parsed.late_work_policy}` : null,
-    parsed.required_materials && parsed.required_materials.length > 0
-      ? `Required Materials:\n${parsed.required_materials.join("\n")}`
-      : null,
-  ].filter(Boolean).join("\n\n");
-
-  if (policyParts.trim()) {
-    chunks.push({
-      source: "syllabus",
-      label: "Course Policies",
-      text: policyParts.slice(0, cap),
-      meta: { section: "policies" },
-    });
-  }
-
-  // ── Weekly schedule ─────────────────────────────────────────────────────────
-  for (const w of parsed.weekly_schedule) {
-    const text = [
-      `Week ${w.week}${w.date_range ? ` (${w.date_range})` : ""}: ${w.topic}`,
-      w.chapters && w.chapters.length > 0 ? `Chapters: ${w.chapters.join(", ")}` : null,
-      `Learning outcomes:\n${w.learning_outcomes.map((o) => `- ${o}`).join("\n")}`,
-    ].filter(Boolean).join("\n");
-
-    chunks.push({
-      source: "syllabus",
-      label: `Week ${w.week}: ${w.topic}`,
-      text: text.slice(0, cap),
-      meta: {
-        section: "weekly_schedule",
-        week: w.week,
-        topics: [w.topic],
-        chapters: w.chapters,
-        date: w.date_range ?? undefined,
-      },
-    });
-  }
-
-  // ── Exam schedule ───────────────────────────────────────────────────────────
-  for (const e of parsed.exam_schedule) {
-    const weightStr = e.weight != null ? `${(e.weight * 100).toFixed(0)}% of final grade` : "see grading policy";
-    const text = [
-      `${e.type.charAt(0).toUpperCase() + e.type.slice(1)} ${e.exam_number}`,
-      `Date: ${e.date}`,
-      `Topics: ${e.topics.join(", ")}`,
-      e.chapters && e.chapters.length > 0 ? `Chapters: ${e.chapters.join(", ")}` : null,
-      `Grade weight: ${weightStr}`,
-      e.notes ? `Note: ${e.notes}` : null,
-    ].filter(Boolean).join("\n");
-
-    chunks.push({
-      source: "syllabus",
-      label: `Exam ${e.exam_number}: ${e.type} — ${e.date}`,
-      text: text.slice(0, cap),
-      meta: {
-        section: "exam_schedule",
-        exam_number: e.exam_number,
-        type: e.type,
-        date: e.date,
-        topics: e.topics,
-        chapters: e.chapters,
-        weight: e.weight,
-      },
-    });
-  }
-
-  // ── Grading breakdown ────────────────────────────────────────────────────────
-  if (parsed.grading_breakdown.length > 0) {
-    const gradingText = [
-      parsed.grading_breakdown
-        .map((g) => `${g.name}: ${(g.weight * 100).toFixed(0)}%${g.description ? ` — ${g.description}` : ""}`)
-        .join("\n"),
-      parsed.grading_notes ? `\nNote: ${parsed.grading_notes}` : null,
-    ].filter(Boolean).join("");
-
-    chunks.push({
-      source: "syllabus",
-      label: "Grading Breakdown",
-      text: gradingText.slice(0, cap),
-      meta: { section: "grading_breakdown" },
-    });
-  }
-
-  return chunks;
-}
-
-// ─── Syllabus parser (3 API calls) ───────────────────────────────────────────
-
-async function parseSyllabus(text: string): Promise<ParsedSyllabusV2> {
-  const metaText = text.slice(0, 10000);
-  const weekText = text.slice(0, 18000);
-  const examText = text.slice(0, 20000);
-
-  async function groqCall(systemPrompt: string, userContent: string, maxTokens: number): Promise<string> {
+  async function groqCall(systemPrompt: string, userContent: string, maxTokens: number) {
     const res = await fetch("/api/chat", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -346,117 +209,44 @@ async function parseSyllabus(text: string): Promise<ParsedSyllabusV2> {
     return raw.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
   }
 
-  const delay = () => new Promise((r) => setTimeout(r, 800));
-
-  // ── Call 1: course info + policies + learning objectives ────────────────────
-  const call1System = `You are an expert at parsing academic nursing course syllabi. Extract structured course information and return ONLY valid JSON — no markdown, no code fences, no extra text.
+  // ── Call 1: course metadata ─────────────────────────────────────────────────
+  const metaSystem = `You are an expert at parsing academic course syllabi. Extract structured information and return ONLY valid JSON — no markdown, no code fences, no extra text.
 
 Return exactly this JSON shape:
 {
-  "course_name": "Full course title",
-  "course_number": "e.g. NUR 301 or null",
-  "instructor_name": "Full name or null",
-  "instructor_email": "Email address or null",
-  "office_hours": "Day, time, location string or null",
-  "course_description": "2-4 sentence course overview paragraph",
-  "learning_objectives": ["objective 1", "objective 2"],
-  "attendance_policy": "Full attendance policy text or null",
-  "late_work_policy": "Late work / makeup policy text or null",
-  "required_materials": ["Textbook title", "Lab manual"]
+  "course_overview": "brief course description and objectives",
+  "office_hours": "instructor name, contact, and office hours details",
+  "grading_policy": "complete grading breakdown with percentages and descriptions"
 }
 
-Rules:
-- learning_objectives: include ALL listed course-level learning objectives, not weekly outcomes.
-- If a field is absent, use null for strings and [] for arrays.
-- Output ONLY the JSON object. Nothing else.`;
+Output ONLY the JSON object. Nothing else.`;
 
-  const call1Raw = await groqCall(call1System, `Parse this syllabus:\n\n${metaText}`, 1024);
-  const call1 = JSON.parse(call1Raw) as Omit<ParsedSyllabusV2, "weekly_schedule" | "exam_schedule" | "grading_breakdown" | "grading_notes">;
+  const metaCleaned = await groqCall(metaSystem, `Parse this syllabus:\n\n${syllabusText.slice(0, 10000)}`, 1024);
+  const meta = JSON.parse(metaCleaned) as Omit<ParsedSyllabus, "weekly_topics">;
 
-  await delay();
+  // Small delay to avoid hitting Groq rate limit between two rapid calls
+  await new Promise((r) => setTimeout(r, 800));
 
-  // ── Call 2: weekly schedule ─────────────────────────────────────────────────
-  const call2System = `You are an expert at parsing academic nursing course syllabi. Extract the complete weekly schedule and return ONLY valid JSON — no markdown, no code fences, no extra text.
+  // ── Call 2: weekly topics only — all 4096 tokens dedicated to weeks ─────────
+  const weeksSystem = `You are an expert at parsing academic course syllabi. Extract the weekly schedule and return ONLY valid JSON — no markdown, no code fences, no extra text.
 
 Return exactly this JSON shape:
 {
-  "weekly_schedule": [
-    {
-      "week": 1,
-      "topic": "Main topic for the week",
-      "learning_outcomes": ["outcome 1", "outcome 2"],
-      "chapters": ["Ch 1", "Ch 2"],
-      "date_range": "Aug 26–30"
-    }
+  "weekly_topics": [
+    { "week": 1, "topic": "Topic Name", "learning_outcomes": ["outcome 1", "outcome 2"] }
   ]
 }
 
 Rules:
-- Include EVERY week listed — do not stop early or skip any week.
-- learning_outcomes: 2–4 concise bullet phrases per week.
-- chapters: list chapter references if present; use [] if none mentioned.
-- date_range: include if dates are shown per week; use null otherwise.
-- If no weekly schedule exists, return { "weekly_schedule": [] }.
+- Include EVERY week listed in the syllabus — do not stop early or skip any week.
+- Keep learning_outcomes to 2-3 concise bullet phrases per week.
+- If no weekly schedule is present, return { "weekly_topics": [] }.
 - Output ONLY the JSON object. Nothing else.`;
 
-  const call2Raw = await groqCall(call2System, `Extract all weekly topics from this syllabus:\n\n${weekText}`, 4096);
-  const call2 = JSON.parse(call2Raw) as Pick<ParsedSyllabusV2, "weekly_schedule">;
+  const weeksCleaned = await groqCall(weeksSystem, `Extract all weekly topics from this syllabus:\n\n${syllabusText}`, 4096);
+  const weeks = JSON.parse(weeksCleaned) as Pick<ParsedSyllabus, "weekly_topics">;
 
-  await delay();
-
-  // ── Call 3: exam schedule + grading breakdown ───────────────────────────────
-  const call3System = `You are an expert at parsing academic nursing course syllabi. Extract all exam/assessment dates and the complete grading breakdown. Return ONLY valid JSON — no markdown, no code fences, no extra text.
-
-Return exactly this JSON shape:
-{
-  "exam_schedule": [
-    {
-      "exam_number": 1,
-      "type": "midterm",
-      "date": "Oct 8",
-      "topics": ["Cardiovascular", "Respiratory"],
-      "chapters": ["Ch 12", "Ch 13"],
-      "weight": 0.25,
-      "notes": "Covers weeks 1–6"
-    }
-  ],
-  "grading_breakdown": [
-    { "name": "Midterm Exam", "weight": 0.25, "description": "Covers weeks 1–6" }
-  ],
-  "grading_notes": "Special pass/fail conditions or null"
-}
-
-Rules:
-- exam_schedule: include every graded exam, quiz, lab practical, or major assessment with a date.
-- exam_number: sequential integers ordered by date (1 = first exam of the term).
-- type: one of "midterm", "final", "quiz", "practical", "lab", "project", or the syllabus label lowercased.
-- weight: decimal fraction (e.g. 0.25 for 25%). Use null if not specified.
-- chapters: include if listed for that exam; use [] if none.
-- grading_breakdown: every grade component with weight as a decimal fraction.
-- grading_notes: special pass/fail conditions or grade rounding rules; null if absent.
-- If no exam schedule exists, return { "exam_schedule": [], "grading_breakdown": [], "grading_notes": null }.
-- Output ONLY the JSON object. Nothing else.`;
-
-  const call3Raw = await groqCall(call3System, `Extract all exams, assessments, and grading details from this syllabus:\n\n${examText}`, 2048);
-  const call3Raw2 = JSON.parse(call3Raw) as { exam_schedule: ExamEntry[]; grading_breakdown: GradeComponent[]; grading_notes?: string };
-
-  // Normalize weight fields (LLMs sometimes return 25 or "25%" instead of 0.25)
-  const exam_schedule: ExamEntry[] = (call3Raw2.exam_schedule ?? []).map((e) => ({
-    ...e,
-    weight: normalizeWeight(e.weight),
-  }));
-  const grading_breakdown: GradeComponent[] = (call3Raw2.grading_breakdown ?? []).map((g) => ({
-    ...g,
-    weight: normalizeWeight(g.weight) ?? 0,
-  }));
-
-  return {
-    ...call1,
-    weekly_schedule: call2.weekly_schedule ?? [],
-    exam_schedule,
-    grading_breakdown,
-    grading_notes: call3Raw2.grading_notes,
-  };
+  return { ...meta, weekly_topics: weeks.weekly_topics };
 }
 
 async function generateQuestionBank(
@@ -843,26 +633,33 @@ export default function TeacherDashboard({ onBack }: { onBack: () => void }) {
         const updated = prev.map((tab) => {
           if (tab.kind !== "week") return tab;
           const weekNum = parseInt(tab.id.replace("week-", ""));
-          const weekData = parsed.weekly_schedule.find((w) => w.week === weekNum);
+          const weekData = parsed.weekly_topics.find((w) => w.week === weekNum);
           if (!weekData) return tab;
           return { ...tab, topic: weekData.topic, learningOutcomes: weekData.learning_outcomes };
         });
         const withoutInfo = updated.filter((t) => t.kind !== "info");
         const infoTabs: CourseTab[] = [
-          makeInfoTab("info-overview", "Course Overview", parsed.course_description),
-          makeInfoTab("info-grading", "Grading Policy",
-            parsed.grading_breakdown.map((g) => `${g.name}: ${(g.weight * 100).toFixed(0)}%${g.description ? ` — ${g.description}` : ""}`).join("\n") +
-            (parsed.grading_notes ? `\n\n${parsed.grading_notes}` : "")
-          ),
-          makeInfoTab("info-office", "Office Hours",
-            [parsed.instructor_name, parsed.instructor_email, parsed.office_hours].filter(Boolean).join("\n")
-          ),
+          makeInfoTab("info-overview", "Course Overview", parsed.course_overview),
+          makeInfoTab("info-grading", "Grading Policy", parsed.grading_policy),
+          makeInfoTab("info-office", "Office Hours", parsed.office_hours),
         ];
         return [...withoutInfo, ...infoTabs];
       });
 
-      // Save to dedicated syllabus pool (does NOT touch nursetutor-published-pool)
-      saveSyllabusPool(syllabusToChunks(parsed));
+      // Auto-publish syllabus content to the shared student pool
+      const syllabusChunks: PooledChunk[] = [
+        ...chunkTeacherText("Syllabus", "Course Overview", parsed.course_overview),
+        ...chunkTeacherText("Syllabus", "Grading Policy", parsed.grading_policy),
+        ...chunkTeacherText("Syllabus", "Office Hours", parsed.office_hours),
+        ...(parsed.weekly_topics.length > 0
+          ? chunkTeacherText("Syllabus", "Weekly Topics", parsed.weekly_topics
+              .map((w) => `Week ${w.week}: ${w.topic}\n${w.learning_outcomes.join("\n")}`)
+              .join("\n\n"))
+          : []),
+      ];
+      const syllabusSourcePrefixes = new Set(["Syllabus — Course Overview", "Syllabus — Grading Policy", "Syllabus — Office Hours", "Syllabus — Weekly Topics"]);
+      const existingPool = loadPublishedPool().filter((c) => !syllabusSourcePrefixes.has(c.source));
+      savePublishedPool([...existingPool, ...syllabusChunks]);
     } catch (err) {
       setSyllabusError(
         err instanceof SyntaxError
@@ -959,7 +756,6 @@ export default function TeacherDashboard({ onBack }: { onBack: () => void }) {
     setSyllabusError("");
     localStorage.removeItem(PUBLISHED_KEY);
     localStorage.removeItem(`${STORAGE_KEY}-filename`);
-    clearSyllabusPool();
     setConfirmClear(false);
   }
 

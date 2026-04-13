@@ -6,7 +6,6 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { cn } from "@/lib/utils";
 import TeacherDashboard from "./TeacherDashboard";
 import { extractChunks, type ProgressCallback } from "./lib/parseFile";
-import type { SyllabusChunk } from "./lib/syllabusTypes";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -66,7 +65,6 @@ interface UploadedDoc {
 
 const POOL_KEY = "nursetutor-chunk-pool";
 const PUBLISHED_POOL_KEY = "nursetutor-published-pool";
-const SYLLABUS_POOL_KEY = "nursetutor-syllabus-pool";
 
 function loadPool(): PooledChunk[] {
   try {
@@ -79,14 +77,6 @@ function loadPool(): PooledChunk[] {
 function loadPublishedPool(): PooledChunk[] {
   try {
     return JSON.parse(localStorage.getItem(PUBLISHED_POOL_KEY) ?? "[]");
-  } catch {
-    return [];
-  }
-}
-
-function loadSyllabusPool(): SyllabusChunk[] {
-  try {
-    return JSON.parse(localStorage.getItem(SYLLABUS_POOL_KEY) ?? "[]");
   } catch {
     return [];
   }
@@ -186,95 +176,16 @@ function getRelevantChunks(pool: PooledChunk[], query: string): string {
     .join("\n\n");
 }
 
-// ─── Syllabus retrieval ───────────────────────────────────────────────────────
-
-const SYLLABUS_TOP_K = 4;
-
-function detectSyllabusIntent(query: string): boolean {
-  return /\b(exam|test|midterm|final|quiz|practical|when is|what week|grading|grade|percent|weight|chapters?|topics? covered|office hours|instructor|textbook|materials|attendance|late work|policy|schedule|syllabus|learning objective)\b/i.test(query);
-}
-
-function getSyllabusChunks(query: string): SyllabusChunk[] {
-  const pool = loadSyllabusPool();
-  if (pool.length === 0) return [];
-
-  const keywords = queryKeywords(query);
-  const lq = query.toLowerCase();
-
-  // ── Metadata pre-filter (falls back to full pool if no results) ──────────────
-  let candidates = pool;
-
-  // Exam number filter: "exam 2", "second exam", "midterm 1"
-  const examNumMatch = lq.match(/\bexam\s*(\d)\b/) ??
-    lq.match(/\b(first|second|third|fourth)\s+(?:exam|midterm|test)\b/);
-  const ordinalMap: Record<string, number> = { first: 1, second: 2, third: 3, fourth: 4 };
-  if (examNumMatch) {
-    const n = parseInt(examNumMatch[1]) || ordinalMap[examNumMatch[1]];
-    if (n) {
-      const filtered = pool.filter((c) => c.meta.section === "exam_schedule" && c.meta.exam_number === n);
-      if (filtered.length > 0) candidates = filtered;
-    }
-  }
-
-  // Week number filter: "week 5"
-  const weekMatch = lq.match(/\bweek\s*(\d{1,2})\b/);
-  if (weekMatch && !examNumMatch) {
-    const w = parseInt(weekMatch[1]);
-    const filtered = pool.filter((c) => c.meta.section === "weekly_schedule" && c.meta.week === w);
-    if (filtered.length > 0) candidates = filtered;
-  }
-
-  // Section-type filters when no structural signal found
-  if (candidates === pool) {
-    if (/\b(grade|grading|percent|weight|breakdown|worth)\b/i.test(lq)) {
-      const f = pool.filter((c) => c.meta.section === "grading_breakdown" || c.meta.section === "exam_schedule");
-      if (f.length > 0) candidates = f;
-    } else if (/\b(office hours?|instructor|professor|email|contact)\b/i.test(lq)) {
-      const f = pool.filter((c) => c.meta.section === "course_info");
-      if (f.length > 0) candidates = f;
-    } else if (/\b(objective|goal|outcome)\b/i.test(lq)) {
-      const f = pool.filter((c) => c.meta.section === "learning_objectives");
-      if (f.length > 0) candidates = f;
-    } else if (/\b(attendance|late|makeup|policy|textbook|material|required)\b/i.test(lq)) {
-      const f = pool.filter((c) => c.meta.section === "policies");
-      if (f.length > 0) candidates = f;
-    } else if (/\b(exam|test|midterm|final|quiz|when)\b/i.test(lq)) {
-      const f = pool.filter((c) => c.meta.section === "exam_schedule");
-      if (f.length > 0) candidates = f;
-    }
-  }
-
-  // ── Keyword scoring (reuse scoreChunk via PooledChunk adapter) ───────────────
-  if (keywords.size === 0) return candidates.slice(0, SYLLABUS_TOP_K);
-
-  return candidates
-    .map((chunk) => ({
-      chunk,
-      score: scoreChunk({ source: chunk.source, label: chunk.label, text: chunk.text }, keywords),
-    }))
-    .sort((a, b) => b.score - a.score)
-    .slice(0, SYLLABUS_TOP_K)
-    .map(({ chunk }) => chunk);
-}
-
 // ─── System prompt ────────────────────────────────────────────────────────────
 
 function buildSystemPrompt(customInstructions?: string, query?: string, intent: Intent = "general"): string {
   const studentPool = loadPool();
   const publishedPool = loadPublishedPool();
   const mergedPool = [...publishedPool, ...studentPool];
+  const hasFiles = mergedPool.length > 0;
 
-  // ── Syllabus context (injected only when query is syllabus-related) ───────────
-  const syllabusChunks = detectSyllabusIntent(query ?? "") ? getSyllabusChunks(query ?? "") : [];
-  const syllabusContext = syllabusChunks.length > 0
-    ? `\n\n━━━ SYLLABUS INFORMATION ━━━\nThe following is from the course syllabus. Use it to answer questions about exam dates, topics covered, grading, policies, or the weekly schedule:\n\n` +
-      syllabusChunks.map((c) => `[${c.label}]\n${c.text.slice(0, 700)}`).join("\n\n") + "\n"
-    : "";
-
-  const hasFiles = mergedPool.length > 0 || syllabusChunks.length > 0;
-
-  const docContext = mergedPool.length > 0
-    ? `\n\nRelevant course material is available. The most relevant sections are shown below. Use these as the PRIMARY source:\n\n` +
+  const docContext = hasFiles
+    ? `\n\nRelevant course material is available. The 4 most relevant sections are shown below. Use these as the PRIMARY source:\n\n` +
       getRelevantChunks(mergedPool, query ?? "") + "\n"
     : "";
 
@@ -284,9 +195,9 @@ function buildSystemPrompt(customInstructions?: string, query?: string, intent: 
 
   const groundingRules = hasFiles
     ? `\n\n━━━ SOURCE RULES ━━━
-- Answer using the provided course material and syllabus information as your primary source. Reference the section label when relevant (e.g. "According to Slide 5..." or "From the syllabus exam schedule...").
+- Answer using the uploaded study material above as your primary source. Reference the section label when relevant (e.g. "According to Slide 5..." or "From Page 3 of cardiac_meds.pdf...").
 - If the student asks about something not covered in the provided sections, say clearly: "That topic isn't in the sections I can see from your uploaded material." Then offer a brief general nursing answer if helpful.
-- Never invent specific details (drug doses, lab values, procedures, exam dates) and present them as coming from the uploaded document.
+- Never invent specific details (drug doses, lab values, procedures) and present them as coming from the uploaded document.
 - If you are drawing on general nursing knowledge rather than the uploaded content, say so briefly.`
     : `\n\n━━━ SOURCE RULES ━━━
 - No study materials are uploaded. Make this clear if the student asks about a specific document or course material: tell them to upload the file first.
@@ -359,7 +270,7 @@ For all non-quiz requests: explain clearly, use bullet points for lists, and kee
     general: explanationSection + quizPhilosophy + tutorMode,
   };
 
-  return `You are NurseTutor, a nursing classroom assistant. Your primary role is to help students understand course material — explain topics, answer questions about uploaded content, and summarize key concepts. You also generate challenging NCLEX-style practice questions when asked.${docContext}${syllabusContext}${customContext}${groundingRules}${sections[intent]}`;
+  return `You are NurseTutor, a nursing classroom assistant. Your primary role is to help students understand course material — explain topics, answer questions about uploaded content, and summarize key concepts. You also generate challenging NCLEX-style practice questions when asked.${docContext}${customContext}${groundingRules}${sections[intent]}`;
 }
 
 // ─── API ──────────────────────────────────────────────────────────────────────
