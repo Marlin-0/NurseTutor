@@ -3,7 +3,7 @@ import { extractText } from "./lib/parseFile";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { cn } from "@/lib/utils";
-import type { SyllabusChunk, ParsedSyllabusV2 } from "./lib/syllabusTypes";
+import type { SyllabusChunk, ParsedSyllabusV2, ExamEntry, GradeComponent } from "./lib/syllabusTypes";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -220,12 +220,11 @@ function syllabusToChunks(parsed: ParsedSyllabusV2): SyllabusChunk[] {
   });
 
   // ── Learning objectives ──────────────────────────────────────────────────────
-  const objectives = Array.isArray(parsed.learning_objectives) ? parsed.learning_objectives : [];
-  if (objectives.length > 0) {
+  if (parsed.learning_objectives.length > 0) {
     chunks.push({
       source: "syllabus",
       label: "Course Learning Objectives",
-      text: objectives.map((o, i) => `${i + 1}. ${o}`).join("\n").slice(0, cap),
+      text: parsed.learning_objectives.map((o, i) => `${i + 1}. ${o}`).join("\n").slice(0, cap),
       meta: { section: "learning_objectives" },
     });
   }
@@ -249,13 +248,11 @@ function syllabusToChunks(parsed: ParsedSyllabusV2): SyllabusChunk[] {
   }
 
   // ── Weekly schedule ─────────────────────────────────────────────────────────
-  for (const w of (Array.isArray(parsed.weekly_schedule) ? parsed.weekly_schedule : [])) {
-    const wChapters = Array.isArray(w.chapters) ? w.chapters : [];
-    const wOutcomes = Array.isArray(w.learning_outcomes) ? w.learning_outcomes : [];
+  for (const w of parsed.weekly_schedule) {
     const text = [
       `Week ${w.week}${w.date_range ? ` (${w.date_range})` : ""}: ${w.topic}`,
-      wChapters.length > 0 ? `Chapters: ${wChapters.join(", ")}` : null,
-      wOutcomes.length > 0 ? `Learning outcomes:\n${wOutcomes.map((o) => `- ${o}`).join("\n")}` : null,
+      w.chapters && w.chapters.length > 0 ? `Chapters: ${w.chapters.join(", ")}` : null,
+      `Learning outcomes:\n${w.learning_outcomes.map((o) => `- ${o}`).join("\n")}`,
     ].filter(Boolean).join("\n");
 
     chunks.push({
@@ -266,47 +263,44 @@ function syllabusToChunks(parsed: ParsedSyllabusV2): SyllabusChunk[] {
         section: "weekly_schedule",
         week: w.week,
         topics: [w.topic],
-        chapters: wChapters,
+        chapters: w.chapters,
         date: w.date_range ?? undefined,
       },
     });
   }
 
   // ── Exam schedule ───────────────────────────────────────────────────────────
-  for (const e of (Array.isArray(parsed.exam_schedule) ? parsed.exam_schedule : [])) {
-    const eTopics = Array.isArray(e.topics) ? e.topics : [];
-    const eChapters = Array.isArray(e.chapters) ? e.chapters : [];
+  for (const e of parsed.exam_schedule) {
     const weightStr = e.weight != null ? `${(e.weight * 100).toFixed(0)}% of final grade` : "see grading policy";
     const text = [
-      `${(e.type ?? "Exam").charAt(0).toUpperCase() + (e.type ?? "Exam").slice(1)} ${e.exam_number}`,
+      `${e.type.charAt(0).toUpperCase() + e.type.slice(1)} ${e.exam_number}`,
       `Date: ${e.date}`,
-      eTopics.length > 0 ? `Topics: ${eTopics.join(", ")}` : null,
-      eChapters.length > 0 ? `Chapters: ${eChapters.join(", ")}` : null,
+      `Topics: ${e.topics.join(", ")}`,
+      e.chapters && e.chapters.length > 0 ? `Chapters: ${e.chapters.join(", ")}` : null,
       `Grade weight: ${weightStr}`,
       e.notes ? `Note: ${e.notes}` : null,
     ].filter(Boolean).join("\n");
 
     chunks.push({
       source: "syllabus",
-      label: `Exam ${e.exam_number}: ${e.type ?? "exam"} — ${e.date}`,
+      label: `Exam ${e.exam_number}: ${e.type} — ${e.date}`,
       text: text.slice(0, cap),
       meta: {
         section: "exam_schedule",
         exam_number: e.exam_number,
         type: e.type,
         date: e.date,
-        topics: eTopics,
-        chapters: eChapters,
+        topics: e.topics,
+        chapters: e.chapters,
         weight: e.weight,
       },
     });
   }
 
   // ── Grading breakdown ────────────────────────────────────────────────────────
-  const gradeComponents = Array.isArray(parsed.grading_breakdown) ? parsed.grading_breakdown : [];
-  if (gradeComponents.length > 0) {
+  if (parsed.grading_breakdown.length > 0) {
     const gradingText = [
-      gradeComponents
+      parsed.grading_breakdown
         .map((g) => `${g.name}: ${(g.weight * 100).toFixed(0)}%${g.description ? ` — ${g.description}` : ""}`)
         .join("\n"),
       parsed.grading_notes ? `\nNote: ${parsed.grading_notes}` : null,
@@ -323,53 +317,15 @@ function syllabusToChunks(parsed: ParsedSyllabusV2): SyllabusChunk[] {
   return chunks;
 }
 
-// ─── Syllabus parser (3 calls, properly spaced for Groq TPM limits) ──────────
-//
-// Groq free tier: 12,000 TPM rolling per minute.
-// Strategy: each call uses ~3,500 tokens, spaced 25s apart.
-//   t=0s  Call 1: metadata    ~1,200 tok input + 800 tok output  = ~2,000 tok
-//   t=25s Call 2: schedule    ~2,500 tok input + 4,000 tok output = ~6,500 tok  ← biggest
-//   t=55s Call 3: grading     ~1,500 tok input + 1,200 tok output = ~2,700 tok
-//   Call 1 exits the 60s window just before call 3 fires — net peak < 11,200 tok.
-//
-// findSectionStart locates the relevant part of the doc for calls 2 & 3
-// so we don't waste tokens on the wrong section.
-
-function findSectionStart(text: string, patterns: RegExp[]): number {
-  let best = -1;
-  for (const p of patterns) {
-    const idx = text.search(p);
-    if (idx !== -1 && (best === -1 || idx < best)) best = idx;
-  }
-  return best;
-}
+// ─── Syllabus parser (3 API calls) ───────────────────────────────────────────
 
 async function parseSyllabus(text: string): Promise<ParsedSyllabusV2> {
+  const metaText = text.slice(0, 10000);
+  const weekText = text.slice(0, 18000);
+  const examText = text.slice(0, 20000);
 
-  // ── Section windows ─────────────────────────────────────────────────────────
-  // Course info is always near the top
-  const metaText = text.slice(0, 4000);
-
-  // Weekly schedule — scan for "Week 1" / "Module 1" etc. and extract from there
-  const schedIdx = findSectionStart(text, [
-    /\bweek\s*1\b/i, /\bmodule\s*1\b/i, /\bunit\s*1\b/i,
-    /\bsession\s*1\b/i, /\blecture\s*1\b/i,
-  ]);
-  const schedFrom = schedIdx === -1 ? 0 : Math.max(0, schedIdx - 300);
-  const weekText = text.slice(schedFrom, schedFrom + 10000); // generous window for 13+ weeks
-
-  // Grading/exam section — scan for relevant headings
-  const gradeIdx = findSectionStart(text, [
-    /\bgrading\b/i, /\bgrade\s*breakdown\b/i,
-    /\bassessment\s*schedule\b/i, /\bexam\s*schedule\b/i,
-    /\bmidterm\b/i, /\bfinal\s*exam\b/i,
-  ]);
-  const gradeFrom = gradeIdx === -1 ? 0 : Math.max(0, gradeIdx - 200);
-  const examText = text.slice(gradeFrom, gradeFrom + 6000);
-
-  // ── Shared groqCall helper ───────────────────────────────────────────────────
   async function groqCall(systemPrompt: string, userContent: string, maxTokens: number): Promise<string> {
-    const attempt = () => fetch("/api/chat", {
+    const res = await fetch("/api/chat", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -381,82 +337,75 @@ async function parseSyllabus(text: string): Promise<ParsedSyllabusV2> {
         ],
       }),
     });
-
-    let res = await attempt();
-    if (res.status === 429) {
-      const sec = parseFloat(res.headers.get("retry-after") ?? "");
-      await new Promise((r) => setTimeout(r, (Number.isFinite(sec) ? sec * 1000 : 62000) + 500));
-      res = await attempt();
-    }
     if (!res.ok) {
-      const body = await res.text().catch(() => "");
-      throw new Error(`API ${res.status}: ${body.slice(0, 200)}`);
+      const errBody = await res.text().catch(() => "");
+      throw new Error(`API ${res.status}: ${errBody.slice(0, 200)}`);
     }
     const data = await res.json();
-    return (data.choices[0].message.content as string)
-      .replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
+    const raw = data.choices[0].message.content as string;
+    return raw.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
   }
 
-  const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
+  const delay = () => new Promise((r) => setTimeout(r, 800));
 
-  // ── Call 1: course metadata + policies (~2,000 tokens, t=0s) ────────────────
-  const meta = JSON.parse(await groqCall(
-    `You are an expert at parsing academic nursing course syllabi. Extract course metadata and return ONLY valid JSON — no markdown, no code fences.
+  // ── Call 1: course info + policies + learning objectives ────────────────────
+  const call1System = `You are an expert at parsing academic nursing course syllabi. Extract structured course information and return ONLY valid JSON — no markdown, no code fences, no extra text.
 
 Return exactly this JSON shape:
 {
-  "course_name": "Full title",
-  "course_number": "NUR 301 or null",
+  "course_name": "Full course title",
+  "course_number": "e.g. NUR 301 or null",
   "instructor_name": "Full name or null",
-  "instructor_email": "email or null",
-  "office_hours": "day, time, location or null",
-  "course_description": "2-3 sentence overview",
+  "instructor_email": "Email address or null",
+  "office_hours": "Day, time, location string or null",
+  "course_description": "2-4 sentence course overview paragraph",
   "learning_objectives": ["objective 1", "objective 2"],
-  "attendance_policy": "full text or null",
-  "late_work_policy": "full text or null",
-  "required_materials": ["Textbook title"]
+  "attendance_policy": "Full attendance policy text or null",
+  "late_work_policy": "Late work / makeup policy text or null",
+  "required_materials": ["Textbook title", "Lab manual"]
 }
-Rules: include ALL learning objectives listed. Use null for absent strings, [] for absent arrays. Output ONLY the JSON.`,
-    `Parse this syllabus:\n\n${metaText}`,
-    800
-  )) as Omit<ParsedSyllabusV2, "weekly_schedule" | "exam_schedule" | "grading_breakdown" | "grading_notes">;
 
-  // 25s gap — lets the 2,000 tokens from call 1 age out of the rolling window
-  await wait(25000);
+Rules:
+- learning_objectives: include ALL listed course-level learning objectives, not weekly outcomes.
+- If a field is absent, use null for strings and [] for arrays.
+- Output ONLY the JSON object. Nothing else.`;
 
-  // ── Call 2: weekly schedule (~6,500 tokens, t=25s) ──────────────────────────
-  const weeksRaw = JSON.parse(await groqCall(
-    `You are an expert at parsing academic nursing course syllabi. Extract the COMPLETE weekly schedule and return ONLY valid JSON — no markdown, no code fences.
+  const call1Raw = await groqCall(call1System, `Parse this syllabus:\n\n${metaText}`, 1024);
+  const call1 = JSON.parse(call1Raw) as Omit<ParsedSyllabusV2, "weekly_schedule" | "exam_schedule" | "grading_breakdown" | "grading_notes">;
+
+  await delay();
+
+  // ── Call 2: weekly schedule ─────────────────────────────────────────────────
+  const call2System = `You are an expert at parsing academic nursing course syllabi. Extract the complete weekly schedule and return ONLY valid JSON — no markdown, no code fences, no extra text.
 
 Return exactly this JSON shape:
 {
   "weekly_schedule": [
     {
       "week": 1,
-      "topic": "Full topic name",
-      "learning_outcomes": ["outcome 1", "outcome 2", "outcome 3"],
+      "topic": "Main topic for the week",
+      "learning_outcomes": ["outcome 1", "outcome 2"],
       "chapters": ["Ch 1", "Ch 2"],
-      "date_range": "Jan 6-10 or null"
+      "date_range": "Aug 26–30"
     }
   ]
 }
+
 Rules:
-- Include EVERY SINGLE week in the document — do not truncate or stop early.
-- learning_outcomes: up to 4 concise phrases per week, copied faithfully from the syllabus.
-- chapters: all chapter/reading references for that week, or [].
-- date_range: exact date string if shown, otherwise null.
-- If no schedule exists return { "weekly_schedule": [] }.
-- Output ONLY the JSON.`,
-    `Extract every weekly topic from this syllabus schedule section:\n\n${weekText}`,
-    4000
-  )) as Pick<ParsedSyllabusV2, "weekly_schedule">;
+- Include EVERY week listed — do not stop early or skip any week.
+- learning_outcomes: 2–4 concise bullet phrases per week.
+- chapters: list chapter references if present; use [] if none mentioned.
+- date_range: include if dates are shown per week; use null otherwise.
+- If no weekly schedule exists, return { "weekly_schedule": [] }.
+- Output ONLY the JSON object. Nothing else.`;
 
-  // 30s gap — call 2 used ~6,500 tokens; wait so they age out before call 3
-  await wait(30000);
+  const call2Raw = await groqCall(call2System, `Extract all weekly topics from this syllabus:\n\n${weekText}`, 4096);
+  const call2 = JSON.parse(call2Raw) as Pick<ParsedSyllabusV2, "weekly_schedule">;
 
-  // ── Call 3: exam schedule + grading (~2,700 tokens, t=55s) ──────────────────
-  const gradingRaw = JSON.parse(await groqCall(
-    `You are an expert at parsing academic nursing course syllabi. Extract all exam dates and the grading breakdown. Return ONLY valid JSON — no markdown, no code fences.
+  await delay();
+
+  // ── Call 3: exam schedule + grading breakdown ───────────────────────────────
+  const call3System = `You are an expert at parsing academic nursing course syllabi. Extract all exam/assessment dates and the complete grading breakdown. Return ONLY valid JSON — no markdown, no code fences, no extra text.
 
 Return exactly this JSON shape:
 {
@@ -466,55 +415,47 @@ Return exactly this JSON shape:
       "type": "midterm",
       "date": "Oct 8",
       "topics": ["Cardiovascular", "Respiratory"],
-      "chapters": ["Ch 4", "Ch 5"],
+      "chapters": ["Ch 12", "Ch 13"],
       "weight": 0.25,
-      "notes": "covers weeks 1-4 or null"
+      "notes": "Covers weeks 1–6"
     }
   ],
   "grading_breakdown": [
-    { "name": "Midterm Exam", "weight": 0.25, "description": "text or null" }
+    { "name": "Midterm Exam", "weight": 0.25, "description": "Covers weeks 1–6" }
   ],
-  "grading_notes": "special conditions or null"
+  "grading_notes": "Special pass/fail conditions or null"
 }
+
 Rules:
-- exam_number: sequential integers ordered by date.
-- type: "midterm", "final", "quiz", "practical", "lab", or the syllabus label lowercased.
-- weight: DECIMAL fraction (0.25 for 25%) — never a percentage string.
-- Include EVERY graded component in grading_breakdown.
-- Output ONLY the JSON.`,
-    `Extract all exams and grading details from this syllabus section:\n\n${examText}`,
-    1200
-  )) as { exam_schedule: ParsedSyllabusV2["exam_schedule"]; grading_breakdown: ParsedSyllabusV2["grading_breakdown"]; grading_notes?: string };
+- exam_schedule: include every graded exam, quiz, lab practical, or major assessment with a date.
+- exam_number: sequential integers ordered by date (1 = first exam of the term).
+- type: one of "midterm", "final", "quiz", "practical", "lab", "project", or the syllabus label lowercased.
+- weight: decimal fraction (e.g. 0.25 for 25%). Use null if not specified.
+- chapters: include if listed for that exam; use [] if none.
+- grading_breakdown: every grade component with weight as a decimal fraction.
+- grading_notes: special pass/fail conditions or grade rounding rules; null if absent.
+- If no exam schedule exists, return { "exam_schedule": [], "grading_breakdown": [], "grading_notes": null }.
+- Output ONLY the JSON object. Nothing else.`;
+
+  const call3Raw = await groqCall(call3System, `Extract all exams, assessments, and grading details from this syllabus:\n\n${examText}`, 2048);
+  const call3Raw2 = JSON.parse(call3Raw) as { exam_schedule: ExamEntry[]; grading_breakdown: GradeComponent[]; grading_notes?: string };
+
+  // Normalize weight fields (LLMs sometimes return 25 or "25%" instead of 0.25)
+  const exam_schedule: ExamEntry[] = (call3Raw2.exam_schedule ?? []).map((e) => ({
+    ...e,
+    weight: normalizeWeight(e.weight),
+  }));
+  const grading_breakdown: GradeComponent[] = (call3Raw2.grading_breakdown ?? []).map((g) => ({
+    ...g,
+    weight: normalizeWeight(g.weight) ?? 0,
+  }));
 
   return {
-    course_name:         meta.course_name ?? "",
-    course_number:       meta.course_number ?? undefined,
-    instructor_name:     meta.instructor_name ?? undefined,
-    instructor_email:    meta.instructor_email ?? undefined,
-    office_hours:        meta.office_hours ?? undefined,
-    course_description:  meta.course_description ?? "",
-    learning_objectives: Array.isArray(meta.learning_objectives) ? meta.learning_objectives : [],
-    attendance_policy:   meta.attendance_policy ?? undefined,
-    late_work_policy:    meta.late_work_policy ?? undefined,
-    required_materials:  Array.isArray(meta.required_materials) ? meta.required_materials : [],
-    weekly_schedule: (Array.isArray(weeksRaw.weekly_schedule) ? weeksRaw.weekly_schedule : []).map((w) => ({
-      ...w,
-      topic:             w.topic ?? "",
-      learning_outcomes: Array.isArray(w.learning_outcomes) ? w.learning_outcomes : [],
-      chapters:          Array.isArray(w.chapters) ? w.chapters : [],
-    })),
-    exam_schedule: (Array.isArray(gradingRaw.exam_schedule) ? gradingRaw.exam_schedule : []).map((e) => ({
-      ...e,
-      type:     e.type ?? "exam",
-      topics:   Array.isArray(e.topics) ? e.topics : [],
-      chapters: Array.isArray(e.chapters) ? e.chapters : [],
-      weight:   normalizeWeight(e.weight),
-    })),
-    grading_breakdown: (Array.isArray(gradingRaw.grading_breakdown) ? gradingRaw.grading_breakdown : []).map((g) => ({
-      ...g,
-      weight: normalizeWeight(g.weight) ?? 0,
-    })),
-    grading_notes: gradingRaw.grading_notes ?? undefined,
+    ...call1,
+    weekly_schedule: call2.weekly_schedule ?? [],
+    exam_schedule,
+    grading_breakdown,
+    grading_notes: call3Raw2.grading_notes,
   };
 }
 
@@ -910,7 +851,7 @@ export default function TeacherDashboard({ onBack }: { onBack: () => void }) {
         const infoTabs: CourseTab[] = [
           makeInfoTab("info-overview", "Course Overview", parsed.course_description),
           makeInfoTab("info-grading", "Grading Policy",
-            (Array.isArray(parsed.grading_breakdown) ? parsed.grading_breakdown : []).map((g) => `${g.name}: ${(g.weight * 100).toFixed(0)}%${g.description ? ` — ${g.description}` : ""}`).join("\n") +
+            parsed.grading_breakdown.map((g) => `${g.name}: ${(g.weight * 100).toFixed(0)}%${g.description ? ` — ${g.description}` : ""}`).join("\n") +
             (parsed.grading_notes ? `\n\n${parsed.grading_notes}` : "")
           ),
           makeInfoTab("info-office", "Office Hours",
@@ -1146,7 +1087,7 @@ export default function TeacherDashboard({ onBack }: { onBack: () => void }) {
       )}
       {syllabusLoading && (
         <div className="shrink-0 px-5 py-2 bg-brand-50 border-b border-brand-200 text-xs text-brand-700 flex items-center gap-2">
-          <span className="animate-spin inline-block">⟳</span> Analyzing syllabus — takes about 60 seconds for accuracy, please wait…
+          <span className="animate-spin inline-block">⟳</span> Analyzing syllabus and populating week topics…
         </div>
       )}
       {hasSyllabus && emptyWeekCount > 0 && !locked && (
