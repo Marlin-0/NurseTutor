@@ -319,16 +319,59 @@ function syllabusToChunks(parsed: ParsedSyllabusV2): SyllabusChunk[] {
 
 // ─── Syllabus parser (3 API calls) ───────────────────────────────────────────
 
+// Pre-extract the section of text where the weekly schedule actually lives.
+// Scans for the first "Week 1" marker (various formats) and returns a window
+// starting 200 chars before it so we capture any header row.
+function extractScheduleSection(text: string, maxChars = 7000): string {
+  // Common patterns: "Week 1", "WEEK 1", "Week One", "Module 1", "Unit 1"
+  const patterns = [
+    /\bweek\s*1\b/i,
+    /\bmodule\s*1\b/i,
+    /\bunit\s*1\b/i,
+    /\bsession\s*1\b/i,
+    /\blecture\s*1\b/i,
+  ];
+  let startIdx = -1;
+  for (const pattern of patterns) {
+    const m = text.search(pattern);
+    if (m !== -1 && (startIdx === -1 || m < startIdx)) startIdx = m;
+  }
+  if (startIdx === -1) return text.slice(0, maxChars); // fallback
+  const from = Math.max(0, startIdx - 200);
+  return text.slice(from, from + maxChars);
+}
+
+// Pre-extract the grading/exam section of the text.
+function extractGradingSection(text: string, maxChars = 5000): string {
+  const patterns = [
+    /\bgrading\b/i,
+    /\bgrade\s*breakdown\b/i,
+    /\bassessment\s*schedule\b/i,
+    /\bexam\s*schedule\b/i,
+    /\bmidterm\b/i,
+    /\bfinal\s*exam\b/i,
+  ];
+  let startIdx = -1;
+  for (const pattern of patterns) {
+    const m = text.search(pattern);
+    if (m !== -1 && (startIdx === -1 || m < startIdx)) startIdx = m;
+  }
+  if (startIdx === -1) return text.slice(0, maxChars);
+  const from = Math.max(0, startIdx - 100);
+  return text.slice(from, from + maxChars);
+}
+
 async function parseSyllabus(text: string): Promise<ParsedSyllabusV2> {
-  // Keep input windows small to stay under Groq's 12,000 TPM free-tier limit.
-  // Total budget across all 3 calls: ~4 chars ≈ 1 token.
-  // Call 1: ~4000/4=1000 input + 600 output = 1600 tokens
-  // Call 2: ~8000/4=2000 input + 2500 output = 4500 tokens
-  // Call 3: ~6000/4=1500 input + 1200 output = 2700 tokens
-  // Total ≈ 8800 tokens — safely under 12,000.
-  const metaText = text.slice(0, 4000);
-  const weekText = text.slice(0, 8000);
-  const examText = text.slice(0, 6000);
+  // Smart section extraction — find where each part of the syllabus actually is
+  // rather than blindly slicing from the top.
+  // Token budget per call (4 chars ≈ 1 token, 12,000 TPM limit):
+  //   Call 1 metadata:  3500 chars input (~875 tok) + 600 output  = 1475
+  //   Call 2 schedule:  7000 chars input (~1750 tok) + 2500 output = 4250
+  //   Call 3 grading:   5000 chars input (~1250 tok) + 1000 output = 2250
+  //   Total ≈ 7975 tokens — safely under 12,000 with 5s gaps.
+  const metaText = text.slice(0, 3500);
+  const weekText = extractScheduleSection(text, 7000);
+  const examText = extractGradingSection(text, 5000);
 
   async function groqCall(systemPrompt: string, userContent: string, maxTokens: number): Promise<string> {
     const attempt = async (): Promise<Response> => {
@@ -457,7 +500,7 @@ Rules:
 - If no exam schedule exists, return { "exam_schedule": [], "grading_breakdown": [], "grading_notes": null }.
 - Output ONLY the JSON object. Nothing else.`;
 
-  const call3Raw = await groqCall(call3System, `Extract all exams, assessments, and grading details from this syllabus:\n\n${examText}`, 1200);
+  const call3Raw = await groqCall(call3System, `Extract all exams, assessments, and grading details from this syllabus:\n\n${examText}`, 1000);
   const call3Raw2 = JSON.parse(call3Raw) as { exam_schedule: ExamEntry[]; grading_breakdown: GradeComponent[]; grading_notes?: string };
 
   // Normalize weight fields (LLMs sometimes return 25 or "25%" instead of 0.25)
