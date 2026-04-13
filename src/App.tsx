@@ -64,10 +64,19 @@ interface UploadedDoc {
 // ─── Chunk pool (localStorage) ────────────────────────────────────────────────
 
 const POOL_KEY = "nursetutor-chunk-pool";
+const PUBLISHED_POOL_KEY = "nursetutor-published-pool";
 
 function loadPool(): PooledChunk[] {
   try {
     return JSON.parse(localStorage.getItem(POOL_KEY) ?? "[]");
+  } catch {
+    return [];
+  }
+}
+
+function loadPublishedPool(): PooledChunk[] {
+  try {
+    return JSON.parse(localStorage.getItem(PUBLISHED_POOL_KEY) ?? "[]");
   } catch {
     return [];
   }
@@ -108,8 +117,19 @@ function queryKeywords(text: string): Set<string> {
 }
 
 // Top-K chunks from the shared pool, each capped at CHUNK_CHAR_CAP characters
-const TOP_K = 4;
+const TOP_K = 3;
 const CHUNK_CHAR_CAP = 700;
+
+type Intent = "explain" | "mcq" | "sata" | "case" | "general";
+
+function detectIntent(message: string): Intent {
+  const m = message.toLowerCase();
+  if (/\b(sata|select all)\b/.test(m)) return "sata";
+  if (/\b(mcq|multiple.?choice)\b/.test(m)) return "mcq";
+  if (/\b(case|scenario)\b/.test(m)) return "case";
+  if (/\b(explain|what is|what are|summarize|describe|tell me about|overview|how does|how do|define|clarify|break down)\b/.test(m)) return "explain";
+  return "general";
+}
 
 function scoreChunk(chunk: PooledChunk, keywords: Set<string>): number {
   const bodyWords = queryKeywords(chunk.text);
@@ -158,13 +178,15 @@ function getRelevantChunks(pool: PooledChunk[], query: string): string {
 
 // ─── System prompt ────────────────────────────────────────────────────────────
 
-function buildSystemPrompt(customInstructions?: string, query?: string): string {
-  const pool = loadPool();
-  const hasFiles = pool.length > 0;
+function buildSystemPrompt(customInstructions?: string, query?: string, intent: Intent = "general"): string {
+  const studentPool = loadPool();
+  const publishedPool = loadPublishedPool();
+  const mergedPool = [...publishedPool, ...studentPool];
+  const hasFiles = mergedPool.length > 0;
 
   const docContext = hasFiles
-    ? `\n\nThe student has uploaded study materials. The 4 most relevant sections across all uploaded files are shown below. Use these as the PRIMARY source:\n\n` +
-      getRelevantChunks(pool, query ?? "") + "\n"
+    ? `\n\nRelevant course material is available. The 4 most relevant sections are shown below. Use these as the PRIMARY source:\n\n` +
+      getRelevantChunks(mergedPool, query ?? "") + "\n"
     : "";
 
   const customContext = customInstructions?.trim()
@@ -181,24 +203,26 @@ function buildSystemPrompt(customInstructions?: string, query?: string): string 
 - No study materials are uploaded. Make this clear if the student asks about a specific document or course material: tell them to upload the file first.
 - Your answers draw from general nursing and NCLEX knowledge only — do not imply you have seen their specific course content.`;
 
-  return `You are NurseTutor, a nursing classroom assistant. Your primary role is to help students understand course material — explain topics, answer questions about uploaded content, and summarize key concepts. You also generate challenging NCLEX-style practice questions when asked.${docContext}${customContext}${groundingRules}
-
+  const explanationSection = `
 ━━━ EXPLANATION MODE ━━━
 When a student asks you to explain a topic, summarize material, or asks a question about course content:
-- Draw directly from the uploaded study material above. Reference specific sections, pages, or slides by name.
-- Structure your explanation clearly: start with the core concept, explain the clinical relevance, then highlight key details the student should remember.
+- Start immediately with the content — no preamble, no "I'll now explain...", no announcing what you're about to do.
+- Draw directly from the uploaded study material above. Reference specific sections, pages, or slides by name when relevant.
+- Structure your explanation clearly: core concept first, then clinical detail, then key points to remember.
 - Use bullet points, numbered steps, or short paragraphs — whichever best fits the content.
-- If the topic spans multiple sections of the uploaded material, synthesize across them.
-- End with 1–2 sentences on why this is clinically important or likely to appear on NCLEX.
+- If the topic spans multiple sections, synthesize across them.
+- Do not add a closing sentence about NCLEX relevance or clinical importance unless it adds something specific and non-obvious.`;
 
+  const quizPhilosophy = `
 ━━━ QUIZ PHILOSOPHY ━━━
 - Questions MUST be clinical and scenario-based — always describe a real patient (age, chief complaint, relevant vitals/labs/history). Never ask pure recall questions like "What is the normal range of X?"
 - Distractors must be sophisticated and plausible. A good distractor is something a reasonable but less experienced nurse might actually choose. Avoid obviously wrong answers.
 - Target application and analysis level (Bloom's). The student should have to reason, not just remember.
 - When study material is uploaded, derive questions directly from that content.
 - Do NOT refer to or suggest selecting a topic — there is no topic selector in the interface. Just generate questions directly.
-- Do NOT use **bold** or any markdown formatting inside question text, options, or explanations — plain text only.
+- Do NOT use **bold** or any markdown formatting inside question text, options, or explanations — plain text only.`;
 
+  const mcqFormat = `
 ━━━ MCQ FORMAT ━━━
 When asked for a multiple-choice question, respond EXACTLY in this format (no preamble, no extra text):
 
@@ -209,8 +233,9 @@ B: [Option — plausible]
 C: [Option — plausible]
 D: [Option — plausible, correct or distractor]
 ANSWER: [Single letter: A, B, C, or D]
-EXPLANATION: [2–3 sentences: why the correct answer is right, why each distractor is wrong or less appropriate, and the clinical rationale.]
+EXPLANATION: [2–3 sentences: why the correct answer is right, why each distractor is wrong or less appropriate, and the clinical rationale.]`;
 
+  const sataFormat = `
 ━━━ SATA FORMAT ━━━
 When asked for a Select All That Apply question, respond EXACTLY in this format (no preamble, no extra text):
 
@@ -222,18 +247,30 @@ C: [Option]
 D: [Option]
 E: [Option]
 ANSWERS: [Comma-separated correct letters, e.g. A,C,E — always 2–4 correct answers out of 5]
-EXPLANATION: [2–3 sentences: why each correct answer applies, why the distractors do not fit the clinical picture.]
+EXPLANATION: [2–3 sentences: why each correct answer applies, why the distractors do not fit the clinical picture.]`;
 
+  const multipleQuestionsFormat = `
 ━━━ MULTIPLE QUESTIONS ━━━
 When the student asks for more than one question, you MUST generate EXACTLY the number requested — no more, no less. Never stop early.
 Separate each question with a line containing only three dashes:
 
 ---
 
-Output ONLY the questions separated by ---. No preamble, no numbering, no summary text. Do not add any closing remarks after the last question.
+Output ONLY the questions separated by ---. No preamble, no numbering, no summary text. Do not add any closing remarks after the last question.`;
 
+  const tutorMode = `
 ━━━ TUTOR MODE ━━━
 For all non-quiz requests: explain clearly, use bullet points for lists, and keep answers clinically relevant and NCLEX-focused. Be encouraging, concise, and precise.`;
+
+  const sections = {
+    explain: explanationSection + tutorMode,
+    mcq:     quizPhilosophy + mcqFormat + multipleQuestionsFormat + tutorMode,
+    sata:    quizPhilosophy + sataFormat + multipleQuestionsFormat + tutorMode,
+    case:    quizPhilosophy + tutorMode,
+    general: explanationSection + quizPhilosophy + tutorMode,
+  };
+
+  return `You are NurseTutor, a nursing classroom assistant. Your primary role is to help students understand course material — explain topics, answer questions about uploaded content, and summarize key concepts. You also generate challenging NCLEX-style practice questions when asked.${docContext}${customContext}${groundingRules}${sections[intent]}`;
 }
 
 // ─── API ──────────────────────────────────────────────────────────────────────
@@ -249,6 +286,7 @@ async function callGroq(
   attempt = 0
 ): Promise<GroqResponse> {
   const lastUserMsg = [...history].reverse().find((t) => t.role === "user")?.content ?? "";
+  const intent = detectIntent(lastUserMsg);
 
   const res = await fetch("/api/chat", {
     method: "POST",
@@ -257,8 +295,8 @@ async function callGroq(
       model: "llama-3.1-8b-instant",
       max_tokens: 4000,
       messages: [
-        { role: "system", content: buildSystemPrompt(customInstructions, lastUserMsg) },
-        ...history.slice(-2).map((turn) => ({ role: turn.role, content: turn.content.slice(0, 1000) })),
+        { role: "system", content: buildSystemPrompt(customInstructions, lastUserMsg, intent) },
+        ...history.slice(-2).map((turn) => ({ role: turn.role, content: turn.content.slice(0, 500) })),
       ],
     }),
   });
@@ -780,7 +818,7 @@ function StudentTutor({ onBack }: { onBack: () => void }) {
       role: "assistant",
       type: "text",
       content:
-        "Welcome! I'm NurseTutor — your nursing classroom assistant.\n\nUpload your course notes, slides, or textbook chapters and I can:\n• Explain any topic from your material\n• Answer questions about course content\n• Summarize key concepts\n• Generate NCLEX-style practice questions (MCQ & SATA)\n\nUse the quick actions below, or just ask me anything!\n\nTip: Use the Instructions button in the top right to set your focus area, difficulty level, or any other preferences.",
+        "Welcome! I'm NurseTutor — your nursing classroom assistant.\n\nI can:\n• Explain any topic from your course material\n• Answer questions about specific content\n• Summarize key concepts\n• Generate NCLEX-style practice questions (MCQ & SATA)\n\nYour professor may have already loaded course materials — just ask me anything. You can also upload your own notes or slides using the panel on the left.\n\nTip: Use the Instructions button in the top right to set your focus area, difficulty level, or any other preferences.",
     };
     setMessages([welcome]);
   }, []);

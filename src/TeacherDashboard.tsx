@@ -54,6 +54,95 @@ function uid() {
 }
 
 const STORAGE_KEY = "nursetutor-teacher-v1";
+const PUBLISHED_KEY = "nursetutor-published-pool";
+
+// ─── Published pool helpers ───────────────────────────────────────────────────
+
+interface PooledChunk { source: string; label: string; text: string; }
+
+const TEACHER_CHUNK_CAP = 700;
+
+function chunkTeacherText(tabLabel: string, fileName: string, content: string): PooledChunk[] {
+  const lines = content.split("\n");
+  const rawChunks: { label: string; text: string }[] = [];
+  let currentLabel = "Part 1";
+  let currentLines: string[] = [];
+  let sectionIndex = 1;
+
+  const isHeading = (line: string): boolean => {
+    const t = line.trim();
+    if (t.length === 0 || t.length > 80) return false;
+    if (/[.!?,;]$/.test(t)) return false;
+    if (!/^[A-Z0-9]/.test(t)) return false;
+    return t.split(/\s+/).length <= 10;
+  };
+
+  const flush = () => {
+    const body = currentLines.join("\n").trim();
+    if (body.length > 0) rawChunks.push({ label: currentLabel, text: body });
+  };
+
+  for (const line of lines) {
+    if (isHeading(line)) {
+      flush();
+      currentLabel = `Part ${sectionIndex++}: ${line.trim()}`;
+      currentLines = [];
+    } else {
+      currentLines.push(line);
+    }
+  }
+  flush();
+
+  // Fall back to word-count grouping if heading split didn't work
+  let segments = rawChunks;
+  if (rawChunks.length <= 1 && content.length > 500) {
+    const paragraphs = content.split(/\n{2,}/).filter((p) => p.trim().length > 0);
+    const grouped: { label: string; text: string }[] = [];
+    let current: string[] = [];
+    let wordCount = 0;
+    let idx = 1;
+    const TARGET_WORDS = 120;
+    const flushGroup = () => {
+      const body = current.join("\n\n").trim();
+      if (body.length > 0) grouped.push({ label: `Part ${idx++}`, text: body });
+      current = [];
+      wordCount = 0;
+    };
+    for (const para of paragraphs) {
+      const words = para.split(/\s+/).length;
+      if (wordCount + words > TARGET_WORDS && current.length > 0) flushGroup();
+      current.push(para);
+      wordCount += words;
+    }
+    flushGroup();
+    segments = grouped;
+  }
+
+  return segments.map((seg) => ({
+    source: `${tabLabel} — ${fileName}`,
+    label: seg.label,
+    text: seg.text.slice(0, TEACHER_CHUNK_CAP),
+  }));
+}
+
+function loadPublishedPool(): PooledChunk[] {
+  try { return JSON.parse(localStorage.getItem(PUBLISHED_KEY) ?? "[]"); } catch { return []; }
+}
+
+function savePublishedPool(pool: PooledChunk[]): void {
+  localStorage.setItem(PUBLISHED_KEY, JSON.stringify(pool));
+}
+
+function publishTab(tab: CourseTab): void {
+  const tabSources = new Set(tab.files.map((f) => `${tab.label} — ${f.name}`));
+  const filtered = loadPublishedPool().filter((c) => !tabSources.has(c.source));
+  const newChunks = tab.files.flatMap((f) => chunkTeacherText(tab.label, f.name, f.content));
+  savePublishedPool([...filtered, ...newChunks]);
+}
+
+function unpublishTabSources(sources: Set<string>): void {
+  savePublishedPool(loadPublishedPool().filter((c) => !sources.has(c.source)));
+}
 
 function loadTabs(): CourseTab[] {
   try {
@@ -96,42 +185,68 @@ function makeInfoTab(id: string, label: string, content: string): CourseTab {
 // ─── API ──────────────────────────────────────────────────────────────────────
 
 async function parseSyllabus(text: string): Promise<ParsedSyllabus> {
-  const system = `You are an expert at parsing academic course syllabi. Extract structured information and return ONLY valid JSON — no markdown, no code fences, no extra text.
+  const syllabusText = text.slice(0, 16000);
+
+  async function groqCall(systemPrompt: string, userContent: string, maxTokens: number) {
+    const res = await fetch("/api/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "llama-3.3-70b-versatile",
+        max_tokens: maxTokens,
+        messages: [
+          { role: "system", content: systemPrompt },
+          { role: "user", content: userContent },
+        ],
+      }),
+    });
+    if (!res.ok) {
+      const errBody = await res.text().catch(() => "");
+      throw new Error(`API ${res.status}: ${errBody.slice(0, 200)}`);
+    }
+    const data = await res.json();
+    const raw = data.choices[0].message.content as string;
+    return raw.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
+  }
+
+  // ── Call 1: course metadata ─────────────────────────────────────────────────
+  const metaSystem = `You are an expert at parsing academic course syllabi. Extract structured information and return ONLY valid JSON — no markdown, no code fences, no extra text.
 
 Return exactly this JSON shape:
 {
   "course_overview": "brief course description and objectives",
   "office_hours": "instructor name, contact, and office hours details",
-  "grading_policy": "complete grading breakdown with percentages and descriptions",
+  "grading_policy": "complete grading breakdown with percentages and descriptions"
+}
+
+Output ONLY the JSON object. Nothing else.`;
+
+  const metaCleaned = await groqCall(metaSystem, `Parse this syllabus:\n\n${syllabusText.slice(0, 10000)}`, 1024);
+  const meta = JSON.parse(metaCleaned) as Omit<ParsedSyllabus, "weekly_topics">;
+
+  // Small delay to avoid hitting Groq rate limit between two rapid calls
+  await new Promise((r) => setTimeout(r, 800));
+
+  // ── Call 2: weekly topics only — all 4096 tokens dedicated to weeks ─────────
+  const weeksSystem = `You are an expert at parsing academic course syllabi. Extract the weekly schedule and return ONLY valid JSON — no markdown, no code fences, no extra text.
+
+Return exactly this JSON shape:
+{
   "weekly_topics": [
     { "week": 1, "topic": "Topic Name", "learning_outcomes": ["outcome 1", "outcome 2"] }
   ]
 }
 
 Rules:
-- Include all weeks mentioned. If weeks are missing from the syllabus, omit them (do not fabricate topics).
-- If a section is not in the syllabus, use an empty string or empty array.
-- learning_outcomes should be concise bullet-style phrases.
+- Include EVERY week listed in the syllabus — do not stop early or skip any week.
+- Keep learning_outcomes to 2-3 concise bullet phrases per week.
+- If no weekly schedule is present, return { "weekly_topics": [] }.
 - Output ONLY the JSON object. Nothing else.`;
 
-  const res = await fetch("/api/chat", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model: "llama-3.3-70b-versatile",
-      max_tokens: 4096,
-      messages: [
-        { role: "system", content: system },
-        { role: "user", content: `Parse this syllabus:\n\n${text.slice(0, 12000)}` },
-      ],
-    }),
-  });
+  const weeksCleaned = await groqCall(weeksSystem, `Extract all weekly topics from this syllabus:\n\n${syllabusText}`, 4096);
+  const weeks = JSON.parse(weeksCleaned) as Pick<ParsedSyllabus, "weekly_topics">;
 
-  if (!res.ok) throw new Error(`API error ${res.status}`);
-  const data = await res.json();
-  const raw = data.choices[0].message.content as string;
-  const cleaned = raw.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
-  return JSON.parse(cleaned) as ParsedSyllabus;
+  return { ...meta, weekly_topics: weeks.weekly_topics };
 }
 
 async function generateQuestionBank(
@@ -324,9 +439,25 @@ export default function TeacherDashboard({ onBack }: { onBack: () => void }) {
   const [syllabusFileName, setSyllabusFileName] = useState(
     () => localStorage.getItem(`${STORAGE_KEY}-filename`) ?? ""
   );
+  const [publishedTabIds, setPublishedTabIds] = useState<Set<string>>(() => {
+    try {
+      const pool = loadPublishedPool();
+      const publishedSources = new Set(pool.map((c) => c.source));
+      const initialTabs = loadTabs();
+      const ids = new Set<string>();
+      for (const tab of initialTabs) {
+        if (tab.files.some((f) => publishedSources.has(`${tab.label} — ${f.name}`))) {
+          ids.add(tab.id);
+        }
+      }
+      return ids;
+    } catch { return new Set(); }
+  });
   const [draggedId, setDraggedId] = useState<string | null>(null);
   const [dragOverId, setDragOverId] = useState<string | null>(null);
   const [locked, setLocked] = useState(false);
+  const [confirmClear, setConfirmClear] = useState(false);
+  const [fileUploading, setFileUploading] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const syllabusInputRef = useRef<HTMLInputElement>(null);
 
@@ -346,16 +477,27 @@ export default function TeacherDashboard({ onBack }: { onBack: () => void }) {
   ).length;
 
   function updateTab(id: string, patch: Partial<CourseTab>) {
+    // If the tab label is being changed and it was published, clear its old published chunks
+    if (patch.label) {
+      const tab = tabs.find((t) => t.id === id);
+      if (tab && patch.label !== tab.label && publishedTabIds.has(id)) {
+        unpublishTabSources(new Set(tab.files.map((f) => `${tab.label} — ${f.name}`)));
+        setPublishedTabIds((prev) => { const s = new Set(prev); s.delete(id); return s; });
+      }
+    }
     setTabs((prev) => prev.map((t) => (t.id === id ? { ...t, ...patch } : t)));
     if (patch.questions) setQuestionIndex(0);
   }
 
   function removeTab(id: string) {
+    if (publishedTabIds.has(id)) {
+      const tab = tabs.find((t) => t.id === id);
+      if (tab) unpublishTabSources(new Set(tab.files.map((f) => `${tab.label} — ${f.name}`)));
+      setPublishedTabIds((prev) => { const s = new Set(prev); s.delete(id); return s; });
+    }
     setTabs((prev) => {
       const next = prev.filter((t) => t.id !== id);
-      if (activeTabId === id) {
-        setActiveTabId(next[0]?.id ?? "week-1");
-      }
+      if (activeTabId === id) setActiveTabId(next[0]?.id ?? "week-1");
       return next;
     });
   }
@@ -388,15 +530,45 @@ export default function TeacherDashboard({ onBack }: { onBack: () => void }) {
       setDragOverId(null);
       return;
     }
-    setTabs((prev) => {
-      const from = prev.findIndex((t) => t.id === draggedId);
-      const to = prev.findIndex((t) => t.id === targetId);
-      if (from === -1 || to === -1) return prev;
-      const next = [...prev];
-      const [item] = next.splice(from, 1);
-      next.splice(to, 0, item);
-      return next;
+
+    const from = tabs.findIndex((t) => t.id === draggedId);
+    const to = tabs.findIndex((t) => t.id === targetId);
+    if (from === -1 || to === -1) { setDraggedId(null); setDragOverId(null); return; }
+
+    const reordered = [...tabs];
+    const [item] = reordered.splice(from, 1);
+    reordered.splice(to, 0, item);
+
+    // Auto-renumber any tab whose label matches "Week N"
+    let weekNum = 1;
+    const renumbered = reordered.map((tab) => {
+      if (tab.kind !== "week") return tab;
+      if (/^Week \d+$/.test(tab.label)) return { ...tab, label: `Week ${weekNum++}` };
+      weekNum++;
+      return tab;
     });
+
+    // Unpublish any tab whose label changed (old source names are now stale)
+    const labelChanged = renumbered.filter((tab) => {
+      const old = tabs.find((t) => t.id === tab.id);
+      return old && old.label !== tab.label && publishedTabIds.has(tab.id);
+    });
+    if (labelChanged.length > 0) {
+      const staleSources = new Set<string>(
+        labelChanged.flatMap((tab) => {
+          const old = tabs.find((t) => t.id === tab.id)!;
+          return old.files.map((f) => `${old.label} — ${f.name}`);
+        })
+      );
+      unpublishTabSources(staleSources);
+      setPublishedTabIds((prev) => {
+        const s = new Set(prev);
+        labelChanged.forEach((tab) => s.delete(tab.id));
+        return s;
+      });
+    }
+
+    setTabs(renumbered);
     setDraggedId(null);
     setDragOverId(null);
   }
@@ -408,9 +580,12 @@ export default function TeacherDashboard({ onBack }: { onBack: () => void }) {
 
   function addCustomTab() {
     if (!newTabName.trim()) return;
+    const weekCount = tabs.filter((t) => t.kind === "week").length;
+    const nextWeekNum = weekCount + 1;
     const newTab: CourseTab = {
       id: uid(),
-      label: newTabName.trim(),
+      label: `Week ${nextWeekNum}`,
+      topic: newTabName.trim(),
       kind: "week",
       isCustom: true,
       files: [],
@@ -452,11 +627,26 @@ export default function TeacherDashboard({ onBack }: { onBack: () => void }) {
         ];
         return [...withoutInfo, ...infoTabs];
       });
+
+      // Auto-publish syllabus content to the shared student pool
+      const syllabusChunks: PooledChunk[] = [
+        ...chunkTeacherText("Syllabus", "Course Overview", parsed.course_overview),
+        ...chunkTeacherText("Syllabus", "Grading Policy", parsed.grading_policy),
+        ...chunkTeacherText("Syllabus", "Office Hours", parsed.office_hours),
+        ...(parsed.weekly_topics.length > 0
+          ? chunkTeacherText("Syllabus", "Weekly Topics", parsed.weekly_topics
+              .map((w) => `Week ${w.week}: ${w.topic}\n${w.learning_outcomes.join("\n")}`)
+              .join("\n\n"))
+          : []),
+      ];
+      const syllabusSourcePrefixes = new Set(["Syllabus — Course Overview", "Syllabus — Grading Policy", "Syllabus — Office Hours", "Syllabus — Weekly Topics"]);
+      const existingPool = loadPublishedPool().filter((c) => !syllabusSourcePrefixes.has(c.source));
+      savePublishedPool([...existingPool, ...syllabusChunks]);
     } catch (err) {
       setSyllabusError(
         err instanceof SyntaxError
           ? "Could not parse the syllabus structure. Try a .txt or .docx version."
-          : "Failed to analyze syllabus. Please try again."
+          : `Failed to analyze syllabus: ${err instanceof Error ? err.message : String(err)}`
       );
       setSyllabusFileName("");
     } finally {
@@ -466,19 +656,47 @@ export default function TeacherDashboard({ onBack }: { onBack: () => void }) {
 
   async function handleFileUpload(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
-    if (!file || !activeTab) return;
+    if (!file) return;
+    const uploadingToTabId = activeTabId; // capture at event time
     e.target.value = "";
+    setFileUploading(true);
+    updateTab(uploadingToTabId, { error: "" });
     try {
       const content = await extractText(file);
-      updateTab(activeTabId, { files: [...activeTab.files, { name: file.name, content }] });
+      const newFile: TabFile = { name: file.name, content };
+      // Use functional setTabs so we always append to the latest files array (fixes stale closure)
+      setTabs((prev) => prev.map((t) =>
+        t.id === uploadingToTabId ? { ...t, files: [...t.files, newFile] } : t
+      ));
     } catch {
-      updateTab(activeTabId, { error: `Could not read ${file.name}. Try .txt, .md, .pdf, .docx, or .pptx.` });
+      updateTab(uploadingToTabId, { error: `Could not read ${file.name}. Try .txt, .md, .pdf, .docx, or .pptx.` });
+    } finally {
+      setFileUploading(false);
     }
   }
 
   function removeFile(fileName: string) {
     if (!activeTab) return;
+    if (publishedTabIds.has(activeTabId)) {
+      unpublishTabSources(new Set([`${activeTab.label} — ${fileName}`]));
+      const remaining = activeTab.files.filter((f) => f.name !== fileName);
+      if (remaining.length === 0) {
+        setPublishedTabIds((prev) => { const s = new Set(prev); s.delete(activeTabId); return s; });
+      }
+    }
     updateTab(activeTabId, { files: activeTab.files.filter((f) => f.name !== fileName) });
+  }
+
+  function handlePublish() {
+    if (!activeTab || activeTab.files.length === 0) return;
+    try {
+      publishTab(activeTab);
+      setPublishedTabIds((prev) => new Set([...prev, activeTabId]));
+    } catch (e) {
+      if (e instanceof DOMException && e.name === "QuotaExceededError") {
+        updateTab(activeTabId, { error: "Storage full — remove some files before publishing." });
+      }
+    }
   }
 
   async function handleGenerate() {
@@ -509,6 +727,18 @@ export default function TeacherDashboard({ onBack }: { onBack: () => void }) {
   function addLearningOutcome() {
     if (!activeTab) return;
     updateTab(activeTabId, { learningOutcomes: [...(activeTab.learningOutcomes ?? []), ""] });
+  }
+
+  function clearDashboard() {
+    const fresh = defaultTabs();
+    setTabs(fresh);
+    setActiveTabId(fresh[0].id);
+    setPublishedTabIds(new Set());
+    setSyllabusFileName("");
+    setSyllabusError("");
+    localStorage.removeItem(PUBLISHED_KEY);
+    localStorage.removeItem(`${STORAGE_KEY}-filename`);
+    setConfirmClear(false);
   }
 
   const infoIcon: Record<string, string> = {
@@ -648,6 +878,9 @@ export default function TeacherDashboard({ onBack }: { onBack: () => void }) {
                       {tab.questions.length}
                     </span>
                   )}
+                  {publishedTabIds.has(tab.id) && (
+                    <span className={cn("shrink-0 w-2 h-2 rounded-full", activeTabId === tab.id ? "bg-white/80" : "bg-emerald-500")} title="Published to students" />
+                  )}
                 </button>
                 {!locked && (
                   <button
@@ -690,7 +923,7 @@ export default function TeacherDashboard({ onBack }: { onBack: () => void }) {
             )}
           </div>
 
-          {/* Sidebar footer: add tab */}
+          {/* Sidebar footer: add tab + clear */}
           <div className="shrink-0 border-t border-border p-2 space-y-1">
             {addingTab ? (
               <div className="space-y-1.5">
@@ -702,7 +935,7 @@ export default function TeacherDashboard({ onBack }: { onBack: () => void }) {
                     if (e.key === "Enter") addCustomTab();
                     if (e.key === "Escape") setAddingTab(false);
                   }}
-                  placeholder="Tab name…"
+                  placeholder="Topic name…"
                   className="w-full text-xs border border-brand-400 rounded-lg px-2 h-7 focus:outline-none focus:ring-1 focus:ring-brand-400 bg-background"
                 />
                 <div className="flex gap-1">
@@ -716,6 +949,24 @@ export default function TeacherDashboard({ onBack }: { onBack: () => void }) {
                 className="w-full text-xs px-3 py-2 rounded-lg border border-dashed border-border text-muted-foreground hover:border-brand-400 hover:text-brand-600 transition-all"
               >
                 + Add tab
+              </button>
+            )}
+
+            {confirmClear ? (
+              <div className="rounded-lg border border-red-200 bg-red-50 p-2 space-y-1.5">
+                <p className="text-[11px] text-red-700 font-medium text-center">Clear everything?</p>
+                <p className="text-[10px] text-red-500 text-center leading-snug">All files, questions, and published data will be removed.</p>
+                <div className="flex gap-1">
+                  <button onClick={clearDashboard} className="flex-1 text-xs bg-red-500 text-white rounded-lg h-7 font-semibold hover:bg-red-600">Clear</button>
+                  <button onClick={() => setConfirmClear(false)} className="flex-1 text-xs border border-border rounded-lg h-7 text-muted-foreground hover:text-foreground">Cancel</button>
+                </div>
+              </div>
+            ) : (
+              <button
+                onClick={() => setConfirmClear(true)}
+                className="w-full text-[11px] px-3 py-1.5 rounded-lg text-muted-foreground/70 hover:text-red-500 hover:bg-red-50 transition-all"
+              >
+                Clear dashboard
               </button>
             )}
           </div>
@@ -824,18 +1075,35 @@ export default function TeacherDashboard({ onBack }: { onBack: () => void }) {
                 <div className="space-y-3">
                   <h2 className="text-sm font-bold text-foreground">{activeTab.label} — Study Material</h2>
                   <div
-                    onClick={() => fileInputRef.current?.click()}
-                    className="border-2 border-dashed border-border rounded-xl px-6 py-8 text-center cursor-pointer hover:border-brand-400 hover:bg-brand-50/40 transition-all bg-white shadow-sm"
+                    onClick={() => !fileUploading && fileInputRef.current?.click()}
+                    className={cn(
+                      "border-2 border-dashed rounded-xl px-6 py-8 text-center transition-all bg-white shadow-sm",
+                      fileUploading
+                        ? "border-brand-300 bg-brand-50/60 cursor-wait"
+                        : "border-border cursor-pointer hover:border-brand-400 hover:bg-brand-50/40"
+                    )}
                   >
-                    <div className="w-10 h-10 rounded-xl bg-brand-50 border border-brand-200 flex items-center justify-center mx-auto mb-3">
-                      <svg viewBox="0 0 24 24" fill="none" className="w-5 h-5 text-brand-500">
-                        <path d="M12 2v10m0 0l-3-3m3 3l3-3M4 16v3a1 1 0 001 1h14a1 1 0 001-1v-3" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
-                      </svg>
-                    </div>
-                    <p className="text-sm font-medium text-foreground">Click to upload files</p>
-                    <p className="text-xs text-muted-foreground mt-1">.txt, .md, .pdf, .docx, .pptx, or images (jpg, png)</p>
+                    {fileUploading ? (
+                      <>
+                        <div className="w-10 h-10 rounded-xl bg-brand-100 border border-brand-200 flex items-center justify-center mx-auto mb-3">
+                          <span className="animate-spin text-brand-500 text-lg">⟳</span>
+                        </div>
+                        <p className="text-sm font-medium text-brand-600">Processing file…</p>
+                        <p className="text-xs text-muted-foreground mt-1">This may take a moment for PDFs</p>
+                      </>
+                    ) : (
+                      <>
+                        <div className="w-10 h-10 rounded-xl bg-brand-50 border border-brand-200 flex items-center justify-center mx-auto mb-3">
+                          <svg viewBox="0 0 24 24" fill="none" className="w-5 h-5 text-brand-500">
+                            <path d="M12 2v10m0 0l-3-3m3 3l3-3M4 16v3a1 1 0 001 1h14a1 1 0 001-1v-3" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+                          </svg>
+                        </div>
+                        <p className="text-sm font-medium text-foreground">Click to upload files</p>
+                        <p className="text-xs text-muted-foreground mt-1">.txt, .md, .pdf, .docx, .pptx, or images (jpg, png)</p>
+                      </>
+                    )}
                   </div>
-                  <input ref={fileInputRef} type="file" accept=".txt,.md,.pdf,.docx,.pptx,.png,.jpg,.jpeg,.webp,.gif" className="hidden" onChange={handleFileUpload} />
+                  <input ref={fileInputRef} type="file" accept=".txt,.md,.pdf,.docx,.pptx,.png,.jpg,.jpeg,.webp,.gif" className="hidden" onChange={handleFileUpload} disabled={fileUploading} />
                   {activeTab.files.length > 0 && (
                     <div className="space-y-1.5">
                       {activeTab.files.map((f) => (
@@ -848,6 +1116,31 @@ export default function TeacherDashboard({ onBack }: { onBack: () => void }) {
                     </div>
                   )}
                 </div>
+
+                {/* Publish to students */}
+                {activeTab.files.length > 0 && (
+                  <div className="flex items-center gap-3 p-3 rounded-xl border border-dashed border-border bg-white shadow-sm">
+                    <div className="flex-1 min-w-0">
+                      {publishedTabIds.has(activeTabId) ? (
+                        <p className="text-xs text-emerald-700 font-semibold">Published — students can ask questions about this material</p>
+                      ) : (
+                        <p className="text-xs text-muted-foreground">Share this week's files with students so their AI chat is grounded in your material.</p>
+                      )}
+                    </div>
+                    <Button
+                      size="sm"
+                      onClick={handlePublish}
+                      className={cn(
+                        "shrink-0 text-xs font-semibold shadow-sm",
+                        publishedTabIds.has(activeTabId)
+                          ? "bg-emerald-500 hover:bg-emerald-600 text-white"
+                          : "bg-brand-500 hover:bg-brand-600 text-white"
+                      )}
+                    >
+                      {publishedTabIds.has(activeTabId) ? "Re-publish" : "Publish to students"}
+                    </Button>
+                  </div>
+                )}
 
                 {/* Generate + Export */}
                 <div className="flex flex-wrap items-center gap-3">
