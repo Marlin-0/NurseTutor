@@ -320,23 +320,42 @@ function syllabusToChunks(parsed: ParsedSyllabusV2): SyllabusChunk[] {
 // ─── Syllabus parser (3 API calls) ───────────────────────────────────────────
 
 async function parseSyllabus(text: string): Promise<ParsedSyllabusV2> {
-  const metaText = text.slice(0, 10000);
-  const weekText = text.slice(0, 18000);
-  const examText = text.slice(0, 20000);
+  // Keep input windows small to stay under Groq's 12,000 TPM free-tier limit.
+  // Total budget across all 3 calls: ~4 chars ≈ 1 token.
+  // Call 1: ~4000/4=1000 input + 600 output = 1600 tokens
+  // Call 2: ~8000/4=2000 input + 2500 output = 4500 tokens
+  // Call 3: ~6000/4=1500 input + 1200 output = 2700 tokens
+  // Total ≈ 8800 tokens — safely under 12,000.
+  const metaText = text.slice(0, 4000);
+  const weekText = text.slice(0, 8000);
+  const examText = text.slice(0, 6000);
 
   async function groqCall(systemPrompt: string, userContent: string, maxTokens: number): Promise<string> {
-    const res = await fetch("/api/chat", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model: "llama-3.3-70b-versatile",
-        max_tokens: maxTokens,
-        messages: [
-          { role: "system", content: systemPrompt },
-          { role: "user", content: userContent },
-        ],
-      }),
-    });
+    const attempt = async (): Promise<Response> => {
+      return fetch("/api/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "llama-3.3-70b-versatile",
+          max_tokens: maxTokens,
+          messages: [
+            { role: "system", content: systemPrompt },
+            { role: "user", content: userContent },
+          ],
+        }),
+      });
+    };
+
+    let res = await attempt();
+
+    // Retry once on 429 — wait as long as Groq asks
+    if (res.status === 429) {
+      const retryAfterSec = parseFloat(res.headers.get("retry-after") ?? "");
+      const waitMs = (Number.isFinite(retryAfterSec) ? retryAfterSec * 1000 : 62000) + 500;
+      await new Promise((r) => setTimeout(r, waitMs));
+      res = await attempt();
+    }
+
     if (!res.ok) {
       const errBody = await res.text().catch(() => "");
       throw new Error(`API ${res.status}: ${errBody.slice(0, 200)}`);
@@ -346,7 +365,8 @@ async function parseSyllabus(text: string): Promise<ParsedSyllabusV2> {
     return raw.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
   }
 
-  const delay = () => new Promise((r) => setTimeout(r, 800));
+  // 5-second gap between calls to avoid burning through TPM too fast
+  const delay = () => new Promise((r) => setTimeout(r, 5000));
 
   // ── Call 1: course info + policies + learning objectives ────────────────────
   const call1System = `You are an expert at parsing academic nursing course syllabi. Extract structured course information and return ONLY valid JSON — no markdown, no code fences, no extra text.
@@ -370,7 +390,7 @@ Rules:
 - If a field is absent, use null for strings and [] for arrays.
 - Output ONLY the JSON object. Nothing else.`;
 
-  const call1Raw = await groqCall(call1System, `Parse this syllabus:\n\n${metaText}`, 1024);
+  const call1Raw = await groqCall(call1System, `Parse this syllabus:\n\n${metaText}`, 600);
   const call1 = JSON.parse(call1Raw) as Omit<ParsedSyllabusV2, "weekly_schedule" | "exam_schedule" | "grading_breakdown" | "grading_notes">;
 
   await delay();
@@ -399,7 +419,7 @@ Rules:
 - If no weekly schedule exists, return { "weekly_schedule": [] }.
 - Output ONLY the JSON object. Nothing else.`;
 
-  const call2Raw = await groqCall(call2System, `Extract all weekly topics from this syllabus:\n\n${weekText}`, 4096);
+  const call2Raw = await groqCall(call2System, `Extract all weekly topics from this syllabus:\n\n${weekText}`, 2500);
   const call2 = JSON.parse(call2Raw) as Pick<ParsedSyllabusV2, "weekly_schedule">;
 
   await delay();
@@ -437,7 +457,7 @@ Rules:
 - If no exam schedule exists, return { "exam_schedule": [], "grading_breakdown": [], "grading_notes": null }.
 - Output ONLY the JSON object. Nothing else.`;
 
-  const call3Raw = await groqCall(call3System, `Extract all exams, assessments, and grading details from this syllabus:\n\n${examText}`, 2048);
+  const call3Raw = await groqCall(call3System, `Extract all exams, assessments, and grading details from this syllabus:\n\n${examText}`, 1200);
   const call3Raw2 = JSON.parse(call3Raw) as { exam_schedule: ExamEntry[]; grading_breakdown: GradeComponent[]; grading_notes?: string };
 
   // Normalize weight fields (LLMs sometimes return 25 or "25%" instead of 0.25)
@@ -1087,7 +1107,7 @@ export default function TeacherDashboard({ onBack }: { onBack: () => void }) {
       )}
       {syllabusLoading && (
         <div className="shrink-0 px-5 py-2 bg-brand-50 border-b border-brand-200 text-xs text-brand-700 flex items-center gap-2">
-          <span className="animate-spin inline-block">⟳</span> Analyzing syllabus and populating week topics…
+          <span className="animate-spin inline-block">⟳</span> Analyzing syllabus — this takes ~20 seconds, please wait…
         </div>
       )}
       {hasSyllabus && emptyWeekCount > 0 && !locked && (
