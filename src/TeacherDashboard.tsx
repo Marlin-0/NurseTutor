@@ -232,7 +232,7 @@ Rules you must follow:
         },
         {
           role: "user",
-          content: `Parse this nursing course syllabus and return the JSON object:\n\n${text}`,
+          content: `Parse this nursing course syllabus and return the JSON object:\n\n${text.slice(0, 14000)}`,
         },
       ],
     }),
