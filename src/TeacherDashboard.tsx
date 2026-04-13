@@ -37,9 +37,12 @@ interface CourseTab {
 }
 
 interface ParsedSyllabus {
-  course_overview: string;
-  office_hours: string;
-  grading_policy: string;
+  course_overview: string;       // Course Information + Description sections
+  office_hours: string;          // Instructor Info section
+  grading_policy: string;        // Assessments section
+  learning_outcomes: string[];   // Course-level Learning Outcomes section
+  required_materials: string;    // Learning Materials section
+  policies: string;              // Policies & Regulations section
   weekly_topics: Array<{
     week: number;
     topic: string;
@@ -201,33 +204,42 @@ async function parseSyllabus(text: string): Promise<ParsedSyllabus> {
       messages: [
         {
           role: "system",
-          content: `You are an expert academic syllabus parser for nursing courses. Your only job is to extract structured information from a syllabus and return it as valid JSON.
+          content: `You are an expert academic syllabus parser for nursing courses. Syllabi follow the UBC Syllabus Generator format with these labeled sections:
 
-Return ONLY this JSON structure — no markdown, no code fences, no explanation, no text before or after the JSON object:
+COURSE BASICS: "Course Information", "Land Acknowledgement" (skip), "Instructor Info", "Description"
+STRUCTURE & SCHEDULE: "Learning design" (skip), "Learning Outcomes", "Assessments", "Activities", "Learning Materials", "Resources" (skip)
+POLICIES & STATEMENTS: "Policies & Regulations", "Optional Statements" (skip), "Copyright" (skip)
+
+Extract data from those labeled sections and return ONLY this JSON — no markdown, no code fences, no explanation:
 
 {
-  "course_overview": "Full course name, course code, description, prerequisites, credit hours, and any stated course objectives or purpose",
-  "office_hours": "Instructor name, email, phone, office location, and all office hour times listed",
-  "grading_policy": "Every graded component with its percentage weight and any relevant grading notes (e.g. Clinical Practice 30%, Midterm Exam 25%, etc.)",
+  "course_overview": "Content from 'Course Information' and 'Description' sections — course name, code, credits, term, prerequisites, and course description",
+  "office_hours": "Content from 'Instructor Info' section — instructor name, email, phone, office location, and all office hour times",
+  "grading_policy": "Content from 'Assessments' section — every graded component with its percentage weight and grading notes",
+  "learning_outcomes": [
+    "Verbatim outcome 1 from the 'Learning Outcomes' section exactly as written",
+    "Verbatim outcome 2 exactly as written"
+  ],
+  "required_materials": "Content from 'Learning Materials' section — all required and recommended textbooks, equipment, and resources",
+  "policies": "Content from 'Policies & Regulations' section — attendance, late work, academic integrity, and any other stated policies",
   "weekly_topics": [
     {
       "week": 1,
-      "topic": "Exact topic name as written in the syllabus",
+      "topic": "Exact topic name from the 'Activities' section",
       "learning_outcomes": [
-        "Verbatim learning outcome 1 exactly as written",
-        "Verbatim learning outcome 2 exactly as written"
+        "Verbatim per-week outcome 1 exactly as written",
+        "Verbatim per-week outcome 2 exactly as written"
       ]
     }
   ]
 }
 
 Rules you must follow:
-- Copy learning_outcomes VERBATIM from the syllabus — do not paraphrase, summarize, or combine them
+- Extract content VERBATIM — do not paraphrase, summarize, or rewrite
 - Each learning outcome is its own array entry — never merge two outcomes into one string
-- Include EVERY week in weekly_topics — do not stop early, do not skip any week
+- Include EVERY week listed in the Activities section — do not stop early or skip any week
 - If a week has no learning outcomes listed, use an empty array []
-- If course_overview, office_hours, or grading_policy are not found, use an empty string ""
-- If no weekly schedule exists, use an empty array [] for weekly_topics
+- If any section is not found in the syllabus, use an empty string "" or empty array []
 - Output ONLY the JSON object — nothing before it, nothing after it`,
         },
         {
@@ -259,6 +271,14 @@ Rules you must follow:
   if (!Array.isArray(parsed.weekly_topics)) {
     throw new Error("Syllabus parse returned invalid structure — missing weekly_topics");
   }
+
+  // Sanitize top-level fields
+  parsed.course_overview    = parsed.course_overview ?? "";
+  parsed.office_hours       = parsed.office_hours ?? "";
+  parsed.grading_policy     = parsed.grading_policy ?? "";
+  parsed.required_materials = parsed.required_materials ?? "";
+  parsed.policies           = parsed.policies ?? "";
+  parsed.learning_outcomes  = Array.isArray(parsed.learning_outcomes) ? parsed.learning_outcomes : [];
 
   // Sanitize each week entry in case Llama returns partial data
   parsed.weekly_topics = parsed.weekly_topics.map((w) => ({
@@ -660,17 +680,29 @@ export default function TeacherDashboard({ onBack }: { onBack: () => void }) {
         });
         const withoutInfo = updated.filter((t) => t.kind !== "info");
         const infoTabs: CourseTab[] = [
-          makeInfoTab("info-overview", "Course Overview", parsed.course_overview),
-          makeInfoTab("info-grading", "Grading Policy", parsed.grading_policy),
-          makeInfoTab("info-office", "Office Hours", parsed.office_hours),
+          makeInfoTab("info-overview",   "Course Overview",    parsed.course_overview),
+          makeInfoTab("info-grading",    "Grading Policy",     parsed.grading_policy),
+          makeInfoTab("info-office",     "Office Hours",       parsed.office_hours),
+          makeInfoTab("info-outcomes",   "Learning Outcomes",  parsed.learning_outcomes.join("\n")),
+          makeInfoTab("info-materials",  "Required Materials", parsed.required_materials),
+          makeInfoTab("info-policies",   "Policies",           parsed.policies),
         ];
         return [...withoutInfo, ...infoTabs];
       });
 
       const syllabusChunks: PooledChunk[] = [
-        ...chunkTeacherText("Syllabus", "Course Overview", parsed.course_overview),
-        ...chunkTeacherText("Syllabus", "Grading Policy", parsed.grading_policy),
-        ...chunkTeacherText("Syllabus", "Office Hours", parsed.office_hours),
+        ...chunkTeacherText("Syllabus", "Course Overview",    parsed.course_overview),
+        ...chunkTeacherText("Syllabus", "Grading Policy",     parsed.grading_policy),
+        ...chunkTeacherText("Syllabus", "Office Hours",       parsed.office_hours),
+        ...(parsed.learning_outcomes.length > 0
+          ? chunkTeacherText("Syllabus", "Learning Outcomes", parsed.learning_outcomes.join("\n"))
+          : []),
+        ...(parsed.required_materials
+          ? chunkTeacherText("Syllabus", "Required Materials", parsed.required_materials)
+          : []),
+        ...(parsed.policies
+          ? chunkTeacherText("Syllabus", "Policies", parsed.policies)
+          : []),
         ...(parsed.weekly_topics.length > 0
           ? chunkTeacherText("Syllabus", "Weekly Topics", parsed.weekly_topics
               .map((w) => `Week ${w.week}: ${w.topic}\n${w.learning_outcomes.join("\n")}`)
@@ -681,6 +713,9 @@ export default function TeacherDashboard({ onBack }: { onBack: () => void }) {
         "Syllabus — Course Overview",
         "Syllabus — Grading Policy",
         "Syllabus — Office Hours",
+        "Syllabus — Learning Outcomes",
+        "Syllabus — Required Materials",
+        "Syllabus — Policies",
         "Syllabus — Weekly Topics",
       ]);
       const existingPool = loadPublishedPool().filter((c) => !syllabusSourcePrefixes.has(c.source));
