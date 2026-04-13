@@ -292,7 +292,7 @@ async function callGroq(
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      model: "llama-3.1-8b-instant",
+      model: intent === "sata" ? "llama-3.3-70b-versatile" : "llama-3.1-8b-instant",
       max_tokens: 4000,
       messages: [
         { role: "system", content: buildSystemPrompt(customInstructions, lastUserMsg, intent) },
