@@ -220,11 +220,12 @@ function syllabusToChunks(parsed: ParsedSyllabusV2): SyllabusChunk[] {
   });
 
   // ── Learning objectives ──────────────────────────────────────────────────────
-  if (parsed.learning_objectives.length > 0) {
+  const objectives = Array.isArray(parsed.learning_objectives) ? parsed.learning_objectives : [];
+  if (objectives.length > 0) {
     chunks.push({
       source: "syllabus",
       label: "Course Learning Objectives",
-      text: parsed.learning_objectives.map((o, i) => `${i + 1}. ${o}`).join("\n").slice(0, cap),
+      text: objectives.map((o, i) => `${i + 1}. ${o}`).join("\n").slice(0, cap),
       meta: { section: "learning_objectives" },
     });
   }
@@ -248,11 +249,13 @@ function syllabusToChunks(parsed: ParsedSyllabusV2): SyllabusChunk[] {
   }
 
   // ── Weekly schedule ─────────────────────────────────────────────────────────
-  for (const w of parsed.weekly_schedule) {
+  for (const w of (Array.isArray(parsed.weekly_schedule) ? parsed.weekly_schedule : [])) {
+    const wChapters = Array.isArray(w.chapters) ? w.chapters : [];
+    const wOutcomes = Array.isArray(w.learning_outcomes) ? w.learning_outcomes : [];
     const text = [
       `Week ${w.week}${w.date_range ? ` (${w.date_range})` : ""}: ${w.topic}`,
-      w.chapters && w.chapters.length > 0 ? `Chapters: ${w.chapters.join(", ")}` : null,
-      `Learning outcomes:\n${w.learning_outcomes.map((o) => `- ${o}`).join("\n")}`,
+      wChapters.length > 0 ? `Chapters: ${wChapters.join(", ")}` : null,
+      wOutcomes.length > 0 ? `Learning outcomes:\n${wOutcomes.map((o) => `- ${o}`).join("\n")}` : null,
     ].filter(Boolean).join("\n");
 
     chunks.push({
@@ -263,44 +266,47 @@ function syllabusToChunks(parsed: ParsedSyllabusV2): SyllabusChunk[] {
         section: "weekly_schedule",
         week: w.week,
         topics: [w.topic],
-        chapters: w.chapters,
+        chapters: wChapters,
         date: w.date_range ?? undefined,
       },
     });
   }
 
   // ── Exam schedule ───────────────────────────────────────────────────────────
-  for (const e of parsed.exam_schedule) {
+  for (const e of (Array.isArray(parsed.exam_schedule) ? parsed.exam_schedule : [])) {
+    const eTopics = Array.isArray(e.topics) ? e.topics : [];
+    const eChapters = Array.isArray(e.chapters) ? e.chapters : [];
     const weightStr = e.weight != null ? `${(e.weight * 100).toFixed(0)}% of final grade` : "see grading policy";
     const text = [
-      `${e.type.charAt(0).toUpperCase() + e.type.slice(1)} ${e.exam_number}`,
+      `${(e.type ?? "Exam").charAt(0).toUpperCase() + (e.type ?? "Exam").slice(1)} ${e.exam_number}`,
       `Date: ${e.date}`,
-      `Topics: ${e.topics.join(", ")}`,
-      e.chapters && e.chapters.length > 0 ? `Chapters: ${e.chapters.join(", ")}` : null,
+      eTopics.length > 0 ? `Topics: ${eTopics.join(", ")}` : null,
+      eChapters.length > 0 ? `Chapters: ${eChapters.join(", ")}` : null,
       `Grade weight: ${weightStr}`,
       e.notes ? `Note: ${e.notes}` : null,
     ].filter(Boolean).join("\n");
 
     chunks.push({
       source: "syllabus",
-      label: `Exam ${e.exam_number}: ${e.type} — ${e.date}`,
+      label: `Exam ${e.exam_number}: ${e.type ?? "exam"} — ${e.date}`,
       text: text.slice(0, cap),
       meta: {
         section: "exam_schedule",
         exam_number: e.exam_number,
         type: e.type,
         date: e.date,
-        topics: e.topics,
-        chapters: e.chapters,
+        topics: eTopics,
+        chapters: eChapters,
         weight: e.weight,
       },
     });
   }
 
   // ── Grading breakdown ────────────────────────────────────────────────────────
-  if (parsed.grading_breakdown.length > 0) {
+  const gradeComponents = Array.isArray(parsed.grading_breakdown) ? parsed.grading_breakdown : [];
+  if (gradeComponents.length > 0) {
     const gradingText = [
-      parsed.grading_breakdown
+      gradeComponents
         .map((g) => `${g.name}: ${(g.weight * 100).toFixed(0)}%${g.description ? ` — ${g.description}` : ""}`)
         .join("\n"),
       parsed.grading_notes ? `\nNote: ${parsed.grading_notes}` : null,
@@ -481,11 +487,34 @@ Rules:
   )) as { exam_schedule: ParsedSyllabusV2["exam_schedule"]; grading_breakdown: ParsedSyllabusV2["grading_breakdown"]; grading_notes?: string };
 
   return {
-    ...meta,
-    weekly_schedule: weeksRaw.weekly_schedule ?? [],
-    exam_schedule: (gradingRaw.exam_schedule ?? []).map((e) => ({ ...e, weight: normalizeWeight(e.weight) })),
-    grading_breakdown: (gradingRaw.grading_breakdown ?? []).map((g) => ({ ...g, weight: normalizeWeight(g.weight) ?? 0 })),
-    grading_notes: gradingRaw.grading_notes,
+    course_name:         meta.course_name ?? "",
+    course_number:       meta.course_number ?? undefined,
+    instructor_name:     meta.instructor_name ?? undefined,
+    instructor_email:    meta.instructor_email ?? undefined,
+    office_hours:        meta.office_hours ?? undefined,
+    course_description:  meta.course_description ?? "",
+    learning_objectives: Array.isArray(meta.learning_objectives) ? meta.learning_objectives : [],
+    attendance_policy:   meta.attendance_policy ?? undefined,
+    late_work_policy:    meta.late_work_policy ?? undefined,
+    required_materials:  Array.isArray(meta.required_materials) ? meta.required_materials : [],
+    weekly_schedule: (Array.isArray(weeksRaw.weekly_schedule) ? weeksRaw.weekly_schedule : []).map((w) => ({
+      ...w,
+      topic:             w.topic ?? "",
+      learning_outcomes: Array.isArray(w.learning_outcomes) ? w.learning_outcomes : [],
+      chapters:          Array.isArray(w.chapters) ? w.chapters : [],
+    })),
+    exam_schedule: (Array.isArray(gradingRaw.exam_schedule) ? gradingRaw.exam_schedule : []).map((e) => ({
+      ...e,
+      type:     e.type ?? "exam",
+      topics:   Array.isArray(e.topics) ? e.topics : [],
+      chapters: Array.isArray(e.chapters) ? e.chapters : [],
+      weight:   normalizeWeight(e.weight),
+    })),
+    grading_breakdown: (Array.isArray(gradingRaw.grading_breakdown) ? gradingRaw.grading_breakdown : []).map((g) => ({
+      ...g,
+      weight: normalizeWeight(g.weight) ?? 0,
+    })),
+    grading_notes: gradingRaw.grading_notes ?? undefined,
   };
 }
 
@@ -881,7 +910,7 @@ export default function TeacherDashboard({ onBack }: { onBack: () => void }) {
         const infoTabs: CourseTab[] = [
           makeInfoTab("info-overview", "Course Overview", parsed.course_description),
           makeInfoTab("info-grading", "Grading Policy",
-            parsed.grading_breakdown.map((g) => `${g.name}: ${(g.weight * 100).toFixed(0)}%${g.description ? ` — ${g.description}` : ""}`).join("\n") +
+            (Array.isArray(parsed.grading_breakdown) ? parsed.grading_breakdown : []).map((g) => `${g.name}: ${(g.weight * 100).toFixed(0)}%${g.description ? ` — ${g.description}` : ""}`).join("\n") +
             (parsed.grading_notes ? `\n\n${parsed.grading_notes}` : "")
           ),
           makeInfoTab("info-office", "Office Hours",
