@@ -184,69 +184,90 @@ function makeInfoTab(id: string, label: string, content: string): CourseTab {
 
 // ─── API ──────────────────────────────────────────────────────────────────────
 
-async function parseSyllabus(text: string): Promise<ParsedSyllabus> {
-  const syllabusText = text.slice(0, 16000);
-
-  async function groqCall(systemPrompt: string, userContent: string, maxTokens: number) {
-    const res = await fetch("/api/chat", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model: "llama-3.3-70b-versatile",
-        max_tokens: maxTokens,
-        messages: [
-          { role: "system", content: systemPrompt },
-          { role: "user", content: userContent },
-        ],
-      }),
-    });
-    if (!res.ok) {
-      const errBody = await res.text().catch(() => "");
-      throw new Error(`API ${res.status}: ${errBody.slice(0, 200)}`);
-    }
-    const data = await res.json();
-    const raw = data.choices[0].message.content as string;
-    return raw.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
-  }
-
-  // ── Call 1: course metadata ─────────────────────────────────────────────────
-  const metaSystem = `You are an expert at parsing academic course syllabi. Extract structured information and return ONLY valid JSON — no markdown, no code fences, no extra text.
-
-Return exactly this JSON shape:
-{
-  "course_overview": "brief course description and objectives",
-  "office_hours": "instructor name, contact, and office hours details",
-  "grading_policy": "complete grading breakdown with percentages and descriptions"
+function extractJSON(raw: string): string {
+  const start = raw.indexOf("{");
+  const end = raw.lastIndexOf("}");
+  if (start === -1 || end === -1) throw new Error("No JSON object found in response");
+  return raw.slice(start, end + 1);
 }
 
-Output ONLY the JSON object. Nothing else.`;
+async function parseSyllabus(text: string): Promise<ParsedSyllabus> {
+  const res = await fetch("/api/chat", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "llama-3.3-70b-versatile",
+      max_tokens: 8192,
+      messages: [
+        {
+          role: "system",
+          content: `You are an expert academic syllabus parser for nursing courses. Your only job is to extract structured information from a syllabus and return it as valid JSON.
 
-  const metaCleaned = await groqCall(metaSystem, `Parse this syllabus:\n\n${syllabusText.slice(0, 10000)}`, 1024);
-  const meta = JSON.parse(metaCleaned) as Omit<ParsedSyllabus, "weekly_topics">;
+Return ONLY this JSON structure — no markdown, no code fences, no explanation, no text before or after the JSON object:
 
-  // Small delay to avoid hitting Groq rate limit between two rapid calls
-  await new Promise((r) => setTimeout(r, 800));
-
-  // ── Call 2: weekly topics only — all 4096 tokens dedicated to weeks ─────────
-  const weeksSystem = `You are an expert at parsing academic course syllabi. Extract the weekly schedule and return ONLY valid JSON — no markdown, no code fences, no extra text.
-
-Return exactly this JSON shape:
 {
+  "course_overview": "Full course name, course code, description, prerequisites, credit hours, and any stated course objectives or purpose",
+  "office_hours": "Instructor name, email, phone, office location, and all office hour times listed",
+  "grading_policy": "Every graded component with its percentage weight and any relevant grading notes (e.g. Clinical Practice 30%, Midterm Exam 25%, etc.)",
   "weekly_topics": [
-    { "week": 1, "topic": "Topic Name", "learning_outcomes": ["outcome 1", "outcome 2"] }
+    {
+      "week": 1,
+      "topic": "Exact topic name as written in the syllabus",
+      "learning_outcomes": [
+        "Verbatim learning outcome 1 exactly as written",
+        "Verbatim learning outcome 2 exactly as written"
+      ]
+    }
   ]
 }
 
-Rules:
-- Include EVERY week listed in the syllabus — do not stop early or skip any week.
-- Keep learning_outcomes to 2-3 concise bullet phrases per week.
-- If no weekly schedule is present, return { "weekly_topics": [] }.
-- Output ONLY the JSON object. Nothing else.`;
+Rules you must follow:
+- Copy learning_outcomes VERBATIM from the syllabus — do not paraphrase, summarize, or combine them
+- Each learning outcome is its own array entry — never merge two outcomes into one string
+- Include EVERY week in weekly_topics — do not stop early, do not skip any week
+- If a week has no learning outcomes listed, use an empty array []
+- If course_overview, office_hours, or grading_policy are not found, use an empty string ""
+- If no weekly schedule exists, use an empty array [] for weekly_topics
+- Output ONLY the JSON object — nothing before it, nothing after it`,
+        },
+        {
+          role: "user",
+          content: `Parse this nursing course syllabus and return the JSON object:\n\n${text}`,
+        },
+      ],
+    }),
+  });
 
-  const weeksCleaned = await groqCall(weeksSystem, `Extract all weekly topics from this syllabus:\n\n${syllabusText}`, 4096);
-  const weeks = JSON.parse(weeksCleaned) as Pick<ParsedSyllabus, "weekly_topics">;
+  if (!res.ok) {
+    const errBody = await res.text().catch(() => "");
+    throw new Error(`API ${res.status}: ${errBody.slice(0, 200)}`);
+  }
 
-  return { ...meta, weekly_topics: weeks.weekly_topics };
+  const data = await res.json();
+  const raw = data.choices[0].message.content as string;
+
+  let parsed: ParsedSyllabus;
+  try {
+    const cleaned = extractJSON(raw);
+    parsed = JSON.parse(cleaned) as ParsedSyllabus;
+  } catch {
+    console.error("parseSyllabus: JSON parse failed\nRaw response:", raw);
+    throw new SyntaxError("Could not parse syllabus response as JSON");
+  }
+
+  // Validate shape
+  if (!Array.isArray(parsed.weekly_topics)) {
+    throw new Error("Syllabus parse returned invalid structure — missing weekly_topics");
+  }
+
+  // Sanitize each week entry in case Llama returns partial data
+  parsed.weekly_topics = parsed.weekly_topics.map((w) => ({
+    week: typeof w.week === "number" ? w.week : parseInt(String(w.week)) || 0,
+    topic: w.topic ?? "Untitled",
+    learning_outcomes: Array.isArray(w.learning_outcomes) ? w.learning_outcomes : [],
+  }));
+
+  return parsed;
 }
 
 async function generateQuestionBank(
@@ -646,7 +667,6 @@ export default function TeacherDashboard({ onBack }: { onBack: () => void }) {
         return [...withoutInfo, ...infoTabs];
       });
 
-      // Auto-publish syllabus content to the shared student pool
       const syllabusChunks: PooledChunk[] = [
         ...chunkTeacherText("Syllabus", "Course Overview", parsed.course_overview),
         ...chunkTeacherText("Syllabus", "Grading Policy", parsed.grading_policy),
@@ -657,7 +677,12 @@ export default function TeacherDashboard({ onBack }: { onBack: () => void }) {
               .join("\n\n"))
           : []),
       ];
-      const syllabusSourcePrefixes = new Set(["Syllabus — Course Overview", "Syllabus — Grading Policy", "Syllabus — Office Hours", "Syllabus — Weekly Topics"]);
+      const syllabusSourcePrefixes = new Set([
+        "Syllabus — Course Overview",
+        "Syllabus — Grading Policy",
+        "Syllabus — Office Hours",
+        "Syllabus — Weekly Topics",
+      ]);
       const existingPool = loadPublishedPool().filter((c) => !syllabusSourcePrefixes.has(c.source));
       savePublishedPool([...existingPool, ...syllabusChunks]);
     } catch (err) {
