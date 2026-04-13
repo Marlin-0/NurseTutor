@@ -317,13 +317,17 @@ function syllabusToChunks(parsed: ParsedSyllabusV2): SyllabusChunk[] {
   return chunks;
 }
 
-// ─── Syllabus parser (single API call) ───────────────────────────────────────
-// One call eliminates TPM rate-limit issues entirely.
-// We build the input by stitching together the most relevant parts of the doc:
-//   • first 2000 chars  → course info (always at the top)
-//   • schedule section  → located by scanning for "Week 1" / "Module 1" etc.
-//   • grading section   → located by scanning for "Grading" / "Midterm" etc.
-// Total input: ~9000 chars ≈ 2250 tokens + 3500 output = ~5750 tokens (under 12k TPM).
+// ─── Syllabus parser (3 calls, properly spaced for Groq TPM limits) ──────────
+//
+// Groq free tier: 12,000 TPM rolling per minute.
+// Strategy: each call uses ~3,500 tokens, spaced 25s apart.
+//   t=0s  Call 1: metadata    ~1,200 tok input + 800 tok output  = ~2,000 tok
+//   t=25s Call 2: schedule    ~2,500 tok input + 4,000 tok output = ~6,500 tok  ← biggest
+//   t=55s Call 3: grading     ~1,500 tok input + 1,200 tok output = ~2,700 tok
+//   Call 1 exits the 60s window just before call 3 fires — net peak < 11,200 tok.
+//
+// findSectionStart locates the relevant part of the doc for calls 2 & 3
+// so we don't waste tokens on the wrong section.
 
 function findSectionStart(text: string, patterns: RegExp[]): number {
   let best = -1;
@@ -334,121 +338,155 @@ function findSectionStart(text: string, patterns: RegExp[]): number {
   return best;
 }
 
-function assembleInput(text: string): string {
-  const HEADER_CHARS = 2500;   // course info is always near the top
-  const SCHED_CHARS  = 5000;   // enough for 13+ weeks
-  const GRADE_CHARS  = 2500;   // grading table is usually compact
+async function parseSyllabus(text: string): Promise<ParsedSyllabusV2> {
 
-  const header = text.slice(0, HEADER_CHARS);
+  // ── Section windows ─────────────────────────────────────────────────────────
+  // Course info is always near the top
+  const metaText = text.slice(0, 4000);
 
-  // Find where the weekly schedule starts
+  // Weekly schedule — scan for "Week 1" / "Module 1" etc. and extract from there
   const schedIdx = findSectionStart(text, [
     /\bweek\s*1\b/i, /\bmodule\s*1\b/i, /\bunit\s*1\b/i,
     /\bsession\s*1\b/i, /\blecture\s*1\b/i,
   ]);
   const schedFrom = schedIdx === -1 ? 0 : Math.max(0, schedIdx - 300);
-  const schedule = schedIdx === -1 ? "" : text.slice(schedFrom, schedFrom + SCHED_CHARS);
+  const weekText = text.slice(schedFrom, schedFrom + 10000); // generous window for 13+ weeks
 
-  // Find where the grading section starts
+  // Grading/exam section — scan for relevant headings
   const gradeIdx = findSectionStart(text, [
     /\bgrading\b/i, /\bgrade\s*breakdown\b/i,
     /\bassessment\s*schedule\b/i, /\bexam\s*schedule\b/i,
     /\bmidterm\b/i, /\bfinal\s*exam\b/i,
   ]);
-  const gradeFrom = gradeIdx === -1 ? 0 : Math.max(0, gradeIdx - 100);
-  const grading = gradeIdx === -1 ? "" : text.slice(gradeFrom, gradeFrom + GRADE_CHARS);
+  const gradeFrom = gradeIdx === -1 ? 0 : Math.max(0, gradeIdx - 200);
+  const examText = text.slice(gradeFrom, gradeFrom + 6000);
 
-  // Stitch together, deduplicating any overlapping content
-  const parts: string[] = [header];
-  if (schedule && !header.includes(schedule.slice(0, 100))) {
-    parts.push("\n\n--- WEEKLY SCHEDULE SECTION ---\n" + schedule);
-  }
-  if (grading && !header.includes(grading.slice(0, 100)) && !schedule.includes(grading.slice(0, 100))) {
-    parts.push("\n\n--- GRADING SECTION ---\n" + grading);
-  }
-  return parts.join("");
-}
-
-async function parseSyllabus(text: string): Promise<ParsedSyllabusV2> {
-  const input = assembleInput(text);
-
-  const system = `You are an expert at parsing academic nursing course syllabi. Extract ALL structured information and return ONLY valid JSON — no markdown, no code fences, no extra text.
-
-Return exactly this JSON shape:
-{
-  "course_name": "Full course title",
-  "course_number": "e.g. NUR 301 or null",
-  "instructor_name": "Full name or null",
-  "instructor_email": "Email or null",
-  "office_hours": "Day, time, location or null",
-  "course_description": "2-3 sentence overview",
-  "learning_objectives": ["objective 1"],
-  "attendance_policy": "text or null",
-  "late_work_policy": "text or null",
-  "required_materials": ["Textbook title"],
-  "weekly_schedule": [
-    { "week": 1, "topic": "Topic", "learning_outcomes": ["outcome"], "chapters": ["Ch 1"], "date_range": "Aug 26-30 or null" }
-  ],
-  "exam_schedule": [
-    { "exam_number": 1, "type": "midterm", "date": "Oct 8", "topics": ["topic"], "chapters": ["Ch 1"], "weight": 0.25, "notes": "text or null" }
-  ],
-  "grading_breakdown": [
-    { "name": "Midterm", "weight": 0.25, "description": "text or null" }
-  ],
-  "grading_notes": "special conditions or null"
-}
-
-Critical rules:
-- weekly_schedule: include EVERY week — do not stop early. If the schedule is cut off, include as many weeks as are visible.
-- exam_number: sequential integers starting at 1, ordered by date.
-- weight: always a decimal fraction (0.25 for 25%). Never a percentage string.
-- If a field is absent, use null for strings and [] for arrays.
-- Output ONLY the JSON object. Nothing else.`;
-
-  const attempt = async (): Promise<Response> =>
-    fetch("/api/chat", {
+  // ── Shared groqCall helper ───────────────────────────────────────────────────
+  async function groqCall(systemPrompt: string, userContent: string, maxTokens: number): Promise<string> {
+    const attempt = () => fetch("/api/chat", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         model: "llama-3.3-70b-versatile",
-        max_tokens: 3500,
+        max_tokens: maxTokens,
         messages: [
-          { role: "system", content: system },
-          { role: "user", content: `Parse this syllabus:\n\n${input}` },
+          { role: "system", content: systemPrompt },
+          { role: "user", content: userContent },
         ],
       }),
     });
 
-  let res = await attempt();
-
-  // Retry once on 429 — wait exactly as long as Groq asks
-  if (res.status === 429) {
-    const retryAfterSec = parseFloat(res.headers.get("retry-after") ?? "");
-    const waitMs = (Number.isFinite(retryAfterSec) ? retryAfterSec * 1000 : 62000) + 500;
-    await new Promise((r) => setTimeout(r, waitMs));
-    res = await attempt();
+    let res = await attempt();
+    if (res.status === 429) {
+      const sec = parseFloat(res.headers.get("retry-after") ?? "");
+      await new Promise((r) => setTimeout(r, (Number.isFinite(sec) ? sec * 1000 : 62000) + 500));
+      res = await attempt();
+    }
+    if (!res.ok) {
+      const body = await res.text().catch(() => "");
+      throw new Error(`API ${res.status}: ${body.slice(0, 200)}`);
+    }
+    const data = await res.json();
+    return (data.choices[0].message.content as string)
+      .replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
   }
 
-  if (!res.ok) {
-    const errBody = await res.text().catch(() => "");
-    throw new Error(`API ${res.status}: ${errBody.slice(0, 200)}`);
-  }
+  const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-  const data = await res.json();
-  const raw = (data.choices[0].message.content as string)
-    .replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
-  const parsed = JSON.parse(raw) as ParsedSyllabusV2;
+  // ── Call 1: course metadata + policies (~2,000 tokens, t=0s) ────────────────
+  const meta = JSON.parse(await groqCall(
+    `You are an expert at parsing academic nursing course syllabi. Extract course metadata and return ONLY valid JSON — no markdown, no code fences.
 
-  // Normalize weight fields (LLM sometimes returns 25 or "25%" instead of 0.25)
-  parsed.exam_schedule = (parsed.exam_schedule ?? []).map((e) => ({
-    ...e, weight: normalizeWeight(e.weight),
-  }));
-  parsed.grading_breakdown = (parsed.grading_breakdown ?? []).map((g) => ({
-    ...g, weight: normalizeWeight(g.weight) ?? 0,
-  }));
-  parsed.weekly_schedule = parsed.weekly_schedule ?? [];
+Return exactly this JSON shape:
+{
+  "course_name": "Full title",
+  "course_number": "NUR 301 or null",
+  "instructor_name": "Full name or null",
+  "instructor_email": "email or null",
+  "office_hours": "day, time, location or null",
+  "course_description": "2-3 sentence overview",
+  "learning_objectives": ["objective 1", "objective 2"],
+  "attendance_policy": "full text or null",
+  "late_work_policy": "full text or null",
+  "required_materials": ["Textbook title"]
+}
+Rules: include ALL learning objectives listed. Use null for absent strings, [] for absent arrays. Output ONLY the JSON.`,
+    `Parse this syllabus:\n\n${metaText}`,
+    800
+  )) as Omit<ParsedSyllabusV2, "weekly_schedule" | "exam_schedule" | "grading_breakdown" | "grading_notes">;
 
-  return parsed;
+  // 25s gap — lets the 2,000 tokens from call 1 age out of the rolling window
+  await wait(25000);
+
+  // ── Call 2: weekly schedule (~6,500 tokens, t=25s) ──────────────────────────
+  const weeksRaw = JSON.parse(await groqCall(
+    `You are an expert at parsing academic nursing course syllabi. Extract the COMPLETE weekly schedule and return ONLY valid JSON — no markdown, no code fences.
+
+Return exactly this JSON shape:
+{
+  "weekly_schedule": [
+    {
+      "week": 1,
+      "topic": "Full topic name",
+      "learning_outcomes": ["outcome 1", "outcome 2", "outcome 3"],
+      "chapters": ["Ch 1", "Ch 2"],
+      "date_range": "Jan 6-10 or null"
+    }
+  ]
+}
+Rules:
+- Include EVERY SINGLE week in the document — do not truncate or stop early.
+- learning_outcomes: up to 4 concise phrases per week, copied faithfully from the syllabus.
+- chapters: all chapter/reading references for that week, or [].
+- date_range: exact date string if shown, otherwise null.
+- If no schedule exists return { "weekly_schedule": [] }.
+- Output ONLY the JSON.`,
+    `Extract every weekly topic from this syllabus schedule section:\n\n${weekText}`,
+    4000
+  )) as Pick<ParsedSyllabusV2, "weekly_schedule">;
+
+  // 30s gap — call 2 used ~6,500 tokens; wait so they age out before call 3
+  await wait(30000);
+
+  // ── Call 3: exam schedule + grading (~2,700 tokens, t=55s) ──────────────────
+  const gradingRaw = JSON.parse(await groqCall(
+    `You are an expert at parsing academic nursing course syllabi. Extract all exam dates and the grading breakdown. Return ONLY valid JSON — no markdown, no code fences.
+
+Return exactly this JSON shape:
+{
+  "exam_schedule": [
+    {
+      "exam_number": 1,
+      "type": "midterm",
+      "date": "Oct 8",
+      "topics": ["Cardiovascular", "Respiratory"],
+      "chapters": ["Ch 4", "Ch 5"],
+      "weight": 0.25,
+      "notes": "covers weeks 1-4 or null"
+    }
+  ],
+  "grading_breakdown": [
+    { "name": "Midterm Exam", "weight": 0.25, "description": "text or null" }
+  ],
+  "grading_notes": "special conditions or null"
+}
+Rules:
+- exam_number: sequential integers ordered by date.
+- type: "midterm", "final", "quiz", "practical", "lab", or the syllabus label lowercased.
+- weight: DECIMAL fraction (0.25 for 25%) — never a percentage string.
+- Include EVERY graded component in grading_breakdown.
+- Output ONLY the JSON.`,
+    `Extract all exams and grading details from this syllabus section:\n\n${examText}`,
+    1200
+  )) as { exam_schedule: ParsedSyllabusV2["exam_schedule"]; grading_breakdown: ParsedSyllabusV2["grading_breakdown"]; grading_notes?: string };
+
+  return {
+    ...meta,
+    weekly_schedule: weeksRaw.weekly_schedule ?? [],
+    exam_schedule: (gradingRaw.exam_schedule ?? []).map((e) => ({ ...e, weight: normalizeWeight(e.weight) })),
+    grading_breakdown: (gradingRaw.grading_breakdown ?? []).map((g) => ({ ...g, weight: normalizeWeight(g.weight) ?? 0 })),
+    grading_notes: gradingRaw.grading_notes,
+  };
 }
 
 async function generateQuestionBank(
@@ -1079,7 +1117,7 @@ export default function TeacherDashboard({ onBack }: { onBack: () => void }) {
       )}
       {syllabusLoading && (
         <div className="shrink-0 px-5 py-2 bg-brand-50 border-b border-brand-200 text-xs text-brand-700 flex items-center gap-2">
-          <span className="animate-spin inline-block">⟳</span> Analyzing syllabus — please wait…
+          <span className="animate-spin inline-block">⟳</span> Analyzing syllabus — takes about 60 seconds for accuracy, please wait…
         </div>
       )}
       {hasSyllabus && emptyWeekCount > 0 && !locked && (
