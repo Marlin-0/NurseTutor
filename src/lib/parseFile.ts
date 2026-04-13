@@ -9,8 +9,8 @@ pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
 
 const IMAGE_EXTS = [".png", ".jpg", ".jpeg", ".webp", ".gif"];
 const OCR_THRESHOLD = 100;  // chars — below this, fall back to vision OCR
-const OCR_DELAY_MS  = 10000; // ms between OCR calls — 6 RPM, conservative for free tier
-const OCR_RETRY_MS  = 60000; // fallback wait if Retry-After header is missing (full minute reset)
+const OCR_DELAY_MS  = 4500;  // ms between OCR calls — safe for Gemini Flash 15 RPM free tier
+const OCR_RETRY_MS  = 15000; // fallback wait if Retry-After header is missing
 
 // ─── Progress callback ────────────────────────────────────────────────────────
 
