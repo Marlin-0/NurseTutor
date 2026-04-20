@@ -3,7 +3,7 @@
   "configurations": [
     {
       "name": "NurseTutor",
-      "runtimeExecutable": "/opt/homebrew/Cellar/node/25.8.2/bin/npm",
+      "runtimeExecutable": "npm",
       "runtimeArgs": ["run", "dev"],
       "port": 3000
     }

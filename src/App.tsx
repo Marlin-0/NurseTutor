@@ -1,11 +1,32 @@
 import React, { useState, useRef, useEffect, useCallback } from "react";
+
+// ─── Dark mode hook ───────────────────────────────────────────────────────────
+
+function useDarkMode(): [boolean, () => void] {
+  const [isDark, setIsDark] = useState<boolean>(() => {
+    const saved = localStorage.getItem("nursetutor-dark");
+    if (saved !== null) return saved === "true";
+    return window.matchMedia("(prefers-color-scheme: dark)").matches;
+  });
+
+  useEffect(() => {
+    document.documentElement.classList.toggle("dark", isDark);
+    localStorage.setItem("nursetutor-dark", String(isDark));
+  }, [isDark]);
+
+  return [isDark, () => setIsDark((d) => !d)];
+}
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { cn } from "@/lib/utils";
 import TeacherDashboard from "./TeacherDashboard";
+import CaseStudyMode from "./cases/CaseStudyMode";
 import { extractChunks, type ProgressCallback } from "./lib/parseFile";
+import type { CaseTree } from "./types/case";
+import { loadMediaDataUrl } from "./types/case";
+import CaseTreeReveal from "./cases/CaseTreeReveal";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -16,6 +37,7 @@ interface TextMessage {
   role: Role;
   type: "text";
   content: string;
+  sources?: Array<{ source: string; label: string; tier: "student" | "teacher" }>;
 }
 
 interface MCQMessage {
@@ -41,7 +63,17 @@ interface SATAMessage {
   submitted: boolean;
 }
 
-type Message = TextMessage | MCQMessage | SATAMessage;
+interface MediaMessage {
+  id: string;
+  role: "assistant";
+  type: "media";
+  caption: string;
+  mediaType: "image" | "audio";
+  dataUrl: string;
+  name: string;
+}
+
+type Message = TextMessage | MCQMessage | SATAMessage | MediaMessage;
 
 interface ConversationTurn {
   role: Role;
@@ -86,6 +118,35 @@ function savePool(pool: PooledChunk[]): void {
   localStorage.setItem(POOL_KEY, JSON.stringify(pool));
 }
 
+// ─── Case shared pool (doc files from the published case) ────────────────────
+
+const CASE_SHARED_POOL_KEY = "nursetutor-case-shared-pool";
+
+function loadCaseSharedPool(): PooledChunk[] {
+  try {
+    return JSON.parse(localStorage.getItem(CASE_SHARED_POOL_KEY) ?? "[]");
+  } catch {
+    return [];
+  }
+}
+
+// ─── Case library (localStorage) ─────────────────────────────────────────────
+// Used in Phase 3 (branch evaluation) — defined here so StudentTutor can access case trees
+
+const CASE_LIBRARY_KEY = "nursetutor-case-library";
+
+export function loadCaseLibrary(): CaseTree[] {
+  try {
+    return JSON.parse(localStorage.getItem(CASE_LIBRARY_KEY) ?? "[]");
+  } catch {
+    return [];
+  }
+}
+
+export function saveCaseLibrary(trees: CaseTree[]): void {
+  localStorage.setItem(CASE_LIBRARY_KEY, JSON.stringify(trees));
+}
+
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 const QUICK_ACTIONS = [
@@ -116,8 +177,7 @@ function queryKeywords(text: string): Set<string> {
   );
 }
 
-// Top-K chunks from the shared pool, each capped at CHUNK_CHAR_CAP characters
-const TOP_K = 3;
+// Per-chunk character cap for standard retrieval (mcq / sata / general)
 const CHUNK_CHAR_CAP = 700;
 
 type Intent = "explain" | "mcq" | "sata" | "case" | "general";
@@ -127,81 +187,140 @@ function detectIntent(message: string): Intent {
   if (/\b(sata|select all)\b/.test(m)) return "sata";
   if (/\b(mcq|multiple.?choice)\b/.test(m)) return "mcq";
   if (/\b(case|scenario)\b/.test(m)) return "case";
-  if (/\b(explain|what is|what are|summarize|describe|tell me about|overview|how does|how do|define|clarify|break down)\b/.test(m)) return "explain";
+  if (/\b(explain|what is|what are|summarize|summarise|describe|tell me about|overview|how does|how do|define|clarify|break down|walk me through|go through|look at|review|read through|go over|cover|what does|what did|teach me|show me)\b/.test(m)) return "explain";
+  // Natural quiz requests without explicit "MCQ" keyword → treat as MCQ
+  if (/\b(quiz|question|questions|practice|test me|give me a q|generate a|make a|create a|another question|one more|a few questions|some questions)\b/.test(m)) return "mcq";
   return "general";
 }
 
 function scoreChunk(chunk: PooledChunk, keywords: Set<string>): number {
   const bodyWords = queryKeywords(chunk.text);
   const labelWords = queryKeywords(chunk.label);
-  // Also score against the source filename — e.g. "cardiac" in "cardiac_meds.pdf"
   const sourceWords = queryKeywords(chunk.source);
   let score = 0;
   for (const kw of keywords) {
     if (labelWords.has(kw)) {
-      // Exact number matches (e.g. "77" in "Page 77") score highest
       score += /^\d+$/.test(kw) ? 10 : 3;
     } else if ([...labelWords].some((w) => w.startsWith(kw) || kw.startsWith(w))) {
       score += 1.5;
     }
-    if (sourceWords.has(kw)) score += 1;
+    // Boost source filename matches strongly — so "seminar 5 ppt" pulls from the right file
+    if (sourceWords.has(kw)) score += 4;
     if (bodyWords.has(kw)) score += 1;
     else if ([...bodyWords].some((w) => w.startsWith(kw) || kw.startsWith(w))) score += 0.5;
   }
   return score;
 }
 
-function getRelevantChunks(pool: PooledChunk[], query: string): string {
-  if (pool.length === 0) return "";
+function getTopChunks(
+  studentPool: PooledChunk[],
+  publishedPool: PooledChunk[],
+  query: string,
+  intent: Intent
+): { studentChunks: PooledChunk[]; teacherChunks: PooledChunk[] } {
+  const keywords = queryKeywords(query);
+  const sortAndScore = (pool: PooledChunk[]) =>
+    pool
+      .map((c) => ({ c, score: keywords.size > 0 ? scoreChunk(c, keywords) : 0 }))
+      .sort((a, b) => b.score - a.score)
+      .map(({ c }) => c);
 
-  let selected: PooledChunk[];
+  if (intent === "explain") {
+    const pickByBudget = (pool: PooledChunk[], budget: number) => {
+      const selected: PooledChunk[] = [];
+      let rem = budget;
+      for (const c of sortAndScore(pool)) {
+        if (rem <= 0) break;
+        selected.push(c);
+        rem -= c.text.length;
+      }
+      return selected;
+    };
+    return {
+      studentChunks: pickByBudget(studentPool, 6_000),
+      teacherChunks: pickByBudget(publishedPool, 3_000),
+    };
+  }
+  return {
+    studentChunks: sortAndScore(studentPool).slice(0, 2),
+    teacherChunks: sortAndScore(publishedPool).slice(0, 1),
+  };
+}
 
-  if (!query.trim()) {
-    selected = pool.slice(0, TOP_K);
-  } else {
-    const keywords = queryKeywords(query);
-    if (keywords.size === 0) {
-      selected = pool.slice(0, TOP_K);
-    } else {
-      selected = pool
-        .map((chunk) => ({ chunk, score: scoreChunk(chunk, keywords) }))
-        .sort((a, b) => b.score - a.score)
-        .slice(0, TOP_K)
-        .map(({ chunk }) => chunk);
-    }
+function getRelevantChunks(
+  studentPool: PooledChunk[],
+  publishedPool: PooledChunk[],
+  query: string,
+  intent: Intent = "general"
+): string {
+  const { studentChunks, teacherChunks } = getTopChunks(studentPool, publishedPool, query, intent);
+
+  if (intent === "explain") {
+    const parts: string[] = [];
+    if (studentChunks.length > 0)
+      parts.push(`── YOUR UPLOADED FILES ──\n` +
+        studentChunks.map((c) => `[${c.source} — ${c.label}]\n${c.text}`).join("\n\n"));
+    if (teacherChunks.length > 0)
+      parts.push(`── TEACHER COURSE MATERIALS ──\n` +
+        teacherChunks.map((c) => `[${c.source} — ${c.label}]\n${c.text}`).join("\n\n"));
+    return parts.join("\n\n");
   }
 
-  return selected
-    .map((c) => `[${c.source} — ${c.label}]\n${c.text.slice(0, CHUNK_CHAR_CAP)}`)
-    .join("\n\n");
+  return [
+    ...studentChunks.map((c) => `[YOUR FILE — ${c.source} — ${c.label}]\n${c.text.slice(0, CHUNK_CHAR_CAP)}`),
+    ...teacherChunks.map((c) => `[TEACHER — ${c.source} — ${c.label}]\n${c.text.slice(0, CHUNK_CHAR_CAP)}`),
+  ].join("\n\n");
 }
 
 // ─── System prompt ────────────────────────────────────────────────────────────
 
-function buildSystemPrompt(customInstructions?: string, query?: string, intent: Intent = "general"): string {
-  const studentPool = loadPool();
-  const publishedPool = loadPublishedPool();
-  const mergedPool = [...publishedPool, ...studentPool];
-  const hasFiles = mergedPool.length > 0;
+interface ActiveCaseContext {
+  tree: CaseTree;
+  currentNodeId: string;
+  turnsAtCurrentNode: number;
+}
 
-  const docContext = hasFiles
-    ? `\n\nRelevant course material is available. The 4 most relevant sections are shown below. Use these as the PRIMARY source:\n\n` +
-      getRelevantChunks(mergedPool, query ?? "") + "\n"
-    : "";
+function buildSystemPrompt(
+  customInstructions?: string,
+  query?: string,
+  intent: Intent = "general",
+  activeCaseCtx?: ActiveCaseContext | null
+): string {
+  const studentPool   = loadPool();
+  const publishedPool = loadPublishedPool();
+  const caseSharedPool = loadCaseSharedPool();
+  const hasFiles = studentPool.length > 0 || publishedPool.length > 0 || caseSharedPool.length > 0;
+
+  // Build doc context — case shared pool is highest priority (injected first)
+  let docContext = "";
+  if (hasFiles) {
+    const parts: string[] = [];
+    if (caseSharedPool.length > 0) {
+      parts.push(`── CASE STUDY MATERIALS ──\n` +
+        caseSharedPool.map((c) => `[${c.source} — ${c.label}]\n${c.text}`).join("\n\n"));
+    }
+    const generalContext = getRelevantChunks(studentPool, publishedPool, query ?? "", intent);
+    if (generalContext) parts.push(generalContext);
+    docContext = `\n\nCourse material is available below in priority order — case materials first, then student files, then teacher materials:\n\n` +
+      parts.join("\n\n") + "\n";
+  }
 
   const customContext = customInstructions?.trim()
     ? `\n\n━━━ CUSTOM INSTRUCTIONS FROM STUDENT ━━━\n${customInstructions.trim()}\nAlways follow the above instructions for every response.\n`
     : "";
 
   const groundingRules = hasFiles
-    ? `\n\n━━━ SOURCE RULES ━━━
-- Answer using the uploaded study material above as your primary source. Reference the section label when relevant (e.g. "According to Slide 5..." or "From Page 3 of cardiac_meds.pdf...").
-- If the student asks about something not covered in the provided sections, say clearly: "That topic isn't in the sections I can see from your uploaded material." Then offer a brief general nursing answer if helpful.
-- Never invent specific details (drug doses, lab values, procedures) and present them as coming from the uploaded document.
-- If you are drawing on general nursing knowledge rather than the uploaded content, say so briefly.`
+    ? `\n\n━━━ SOURCE PRIORITY ━━━
+Answer using sources in this exact order:
+1. YOUR UPLOADED FILES — the student's own notes and slides. Always check these first. Reference by label (e.g. "From your Slide 5..." or "From your Page 3...").
+2. TEACHER COURSE MATERIALS — published course content from the teacher. Use when the student's files don't cover the topic.
+3. If the topic is clinical/nursing — you may draw on general nursing knowledge, but you MUST preface it with: "This isn't in your uploaded files, but from general nursing knowledge..."
+4. If the topic is course admin (dates, grades, schedules, instructor info) and it's not in the files — say exactly: "That information isn't in your uploaded materials." Then STOP. Do not add suggestions, generic advice, or filler. One sentence, done.
+- Never present general knowledge as if it came from an uploaded file.
+- Never invent specific details (drug doses, lab values, procedures) and attribute them to a document.`
     : `\n\n━━━ SOURCE RULES ━━━
-- No study materials are uploaded. Make this clear if the student asks about a specific document or course material: tell them to upload the file first.
-- Your answers draw from general nursing and NCLEX knowledge only — do not imply you have seen their specific course content.`;
+- No study materials are uploaded. If the student asks about a specific document, tell them to upload it first.
+- Answers draw from general nursing and NCLEX knowledge only — do not imply you have seen their specific course content.`;
 
   const explanationSection = `
 ━━━ EXPLANATION MODE ━━━
@@ -270,7 +389,94 @@ For all non-quiz requests: explain clearly, use bullet points for lists, and kee
     general: explanationSection + quizPhilosophy + tutorMode,
   };
 
-  return `You are NurseTutor, a nursing classroom assistant. Your primary role is to help students understand course material — explain topics, answer questions about uploaded content, and summarize key concepts. You also generate challenging NCLEX-style practice questions when asked.${docContext}${customContext}${groundingRules}${sections[intent]}`;
+  // ── Branch evaluation injection (only when active simulation has a case tree) ──
+  let branchBlock = "";
+  if (activeCaseCtx && (intent === "case" || intent === "general")) {
+    const { tree, currentNodeId, turnsAtCurrentNode } = activeCaseCtx;
+    const currentNode = tree.nodes.find((n) => n.id === currentNodeId);
+    const availableBranches = tree.branches.filter((b) => b.fromNodeId === currentNodeId);
+
+    if (currentNode) {
+      branchBlock = `\n\n━━━ CASE SIMULATION CONTEXT ━━━`;
+
+      // Patient profile
+      const p = tree.patientProfile;
+      if (p) {
+        const vitals = p.vitals;
+        const pLines: string[] = [];
+        if (p.name || p.age || p.gender)
+          pLines.push(`Patient: ${[p.name, p.age ? `${p.age}yo` : "", p.gender].filter(Boolean).join(", ")}`);
+        if (p.chiefComplaint)   pLines.push(`CC: ${p.chiefComplaint}`);
+        if (p.primaryDiagnosis) pLines.push(`Dx: ${p.primaryDiagnosis}`);
+        if (p.medications)      pLines.push(`Meds: ${p.medications}`);
+        if (p.allergies)        pLines.push(`Allergies: ${p.allergies}`);
+        const vParts = [
+          vitals.bp   && `BP ${vitals.bp}`,
+          vitals.hr   && `HR ${vitals.hr}`,
+          vitals.spo2 && `SpO₂ ${vitals.spo2}`,
+          vitals.temp && `Temp ${vitals.temp}`,
+        ].filter(Boolean);
+        if (vParts.length > 0) pLines.push(`Vitals: ${vParts.join(" | ")}`);
+        if (p.imagingNotes) pLines.push(`Imaging: ${p.imagingNotes}`);
+        if (p.labNotes)     pLines.push(`Labs: ${p.labNotes}`);
+        if (pLines.length > 0) branchBlock += `\n\nPATIENT\n${pLines.join("\n")}`;
+      }
+
+      // Node situation
+      if (currentNode.situation) {
+        branchBlock += `\nCurrent situation: ${currentNode.situation}`;
+      }
+
+      // Completion criteria
+      if (currentNode.completionCriteria) {
+        branchBlock += `\nFor the student to complete this checkpoint they must: ${currentNode.completionCriteria}`;
+      }
+
+      // Completion narration
+      if (currentNode.completionNarration) {
+        branchBlock += `\nWhen the student completes this checkpoint, narrate: "${currentNode.completionNarration}"`;
+      }
+
+      // Active deterioration consequences
+      const activeConsequences = (currentNode.consequences ?? [])
+        .filter((c) => turnsAtCurrentNode >= c.afterTurns);
+      if (activeConsequences.length > 0) {
+        branchBlock += `\n\nACTIVE DETERIORATION EVENTS (weave these naturally into your narrative — do not read them out verbatim):\n` +
+          activeConsequences.map((c) =>
+            `- [${c.severity.toUpperCase()}] ${c.description}`
+          ).join("\n");
+      }
+
+      // Branch evaluation
+      if (availableBranches.length > 0) {
+        branchBlock +=
+          `\n\n━━━ BRANCH EVALUATION ━━━` +
+          `\nStudent is at: "${currentNode.label}"` +
+          `\nAvailable next steps — pick the one the student's message matches:\n` +
+          availableBranches.map((b) => `Branch ID "${b.id}": "${b.triggerPhrase}"`).join("\n") +
+          `\n\nAfter your narrative response, append ONE tag on its own line:` +
+          `\n[BRANCH: <branch_id> confidence=<0-100>]   — if a branch matches` +
+          `\n[BRANCH: null]                               — if no branch matches or you are unsure` +
+          `\nDo NOT mention branches in your narrative. This tag is internal only.`;
+      }
+
+      // Available media
+      const availableMedia = tree.mediaFiles ?? [];
+      if (availableMedia.length > 0) {
+        branchBlock += `\n\nAVAILABLE SIMULATION MEDIA:\n` +
+          availableMedia.map((m) =>
+            `- keyword "${m.triggerKeyword}" (${m.type}) — mode: ${m.triggerMode}${m.description ? ` — "${m.description}"` : ""}`
+          ).join("\n") +
+          `\n\nMedia rules:` +
+          `\n- "student-asks" mode: ONLY display when student explicitly requests it` +
+          `\n- "ai-auto" mode: proactively surface when clinically appropriate` +
+          `\nWhen displaying media, write your narrative AND append on its own line: [MEDIA: keyword]` +
+          `\nExample: student asks to auscultate → narrate findings → append [MEDIA: lung-sounds]`;
+      }
+    }
+  }
+
+  return `You are NurseTutor, a nursing classroom assistant. Your primary role is to help students understand course material — explain topics, answer questions about uploaded content, and summarize key concepts. You also generate challenging NCLEX-style practice questions when asked.${docContext}${customContext}${groundingRules}${sections[intent]}${branchBlock}`;
 }
 
 // ─── API ──────────────────────────────────────────────────────────────────────
@@ -283,30 +489,40 @@ interface GroqResponse {
 async function callGroq(
   history: ConversationTurn[],
   customInstructions?: string,
-  attempt = 0
+  attempt = 0,
+  activeCaseCtx?: ActiveCaseContext | null
 ): Promise<GroqResponse> {
   const lastUserMsg = [...history].reverse().find((t) => t.role === "user")?.content ?? "";
   const intent = detectIntent(lastUserMsg);
+
+  // Case simulations use a larger model and full history for state continuity
+  const isSimulation = intent === "case" || (activeCaseCtx != null);
+  const model = isSimulation || intent === "sata"
+    ? "llama-3.3-70b-versatile"
+    : "llama-3.1-8b-instant";
+
+  const messageHistory = isSimulation
+    ? history.map((t) => ({ role: t.role, content: t.content }))
+    : history.slice(-2).map((t) => ({ role: t.role, content: t.content.slice(0, 500) }));
 
   const res = await fetch("/api/chat", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      model: "llama-3.1-8b-instant",
-      max_tokens: 4000,
+      model,
+      max_tokens: isSimulation ? 1200 : 4000,
       messages: [
-        { role: "system", content: buildSystemPrompt(customInstructions, lastUserMsg, intent) },
-        ...history.slice(-2).map((turn) => ({ role: turn.role, content: turn.content.slice(0, 500) })),
+        { role: "system", content: buildSystemPrompt(customInstructions, lastUserMsg, intent, activeCaseCtx) },
+        ...messageHistory,
       ],
     }),
   });
 
   if (res.status === 429 && attempt < 3) {
-    // Wait exactly as long as Groq asks, then retry — never fires multiple requests at once
     const retryAfterSec = parseFloat(res.headers.get("retry-after") ?? "");
     const waitMs = (Number.isFinite(retryAfterSec) ? retryAfterSec * 1000 : 15000) + 1000;
     await new Promise((r) => setTimeout(r, waitMs));
-    return callGroq(history, customInstructions, attempt + 1);
+    return callGroq(history, customInstructions, attempt + 1, activeCaseCtx);
   }
 
   if (!res.ok) throw new Error(`API error ${res.status}`);
@@ -434,6 +650,12 @@ function uid() {
   return Math.random().toString(36).slice(2);
 }
 
+// Regex for parsing/stripping the AI's [BRANCH: ...] tag in simulation mode
+const BRANCH_REGEX = /\[BRANCH:\s*([\w-]+|null)\s*(?:confidence=(\d+))?\]/;
+
+// Regex for parsing/stripping the AI's [MEDIA: keyword] tag
+const MEDIA_REGEX = /\[MEDIA:\s*([\w-]+)\s*\]/;
+
 // ─── Sub-components ───────────────────────────────────────────────────────────
 
 function LoadingDots() {
@@ -491,6 +713,11 @@ function MCQCard({
                 answered && !isChosen && !isCorrect && "border-border opacity-40"
               )}
             >
+              {!answered && (
+                <span className="shrink-0 text-[9px] text-muted-foreground/40 font-mono w-3 text-right mt-1">
+                  {(["A","B","C","D"] as const).indexOf(letter) + 1}
+                </span>
+              )}
               <span
                 className={cn(
                   "shrink-0 w-5 h-5 rounded-full border text-xs flex items-center justify-center font-semibold mt-0.5",
@@ -546,7 +773,7 @@ function SATACard({
       <div className="flex items-center gap-2">
         <Badge
           variant="outline"
-          className="text-xs border-violet-400 text-violet-600 dark:text-violet-400"
+          className="text-xs border-red-400 text-red-600 dark:text-red-400"
         >
           SATA
         </Badge>
@@ -567,10 +794,10 @@ function SATACard({
                 "flex items-start gap-2.5 cursor-pointer",
                 !submitted &&
                   isSelected &&
-                  "border-violet-500 bg-violet-50 dark:bg-violet-950/30",
+                  "border-red-500 bg-red-50 dark:bg-red-950/30",
                 !submitted &&
                   !isSelected &&
-                  "border-border bg-card hover:border-violet-300 hover:bg-violet-50/50 dark:hover:bg-violet-950/10",
+                  "border-border bg-card hover:border-red-300 hover:bg-red-50/50 dark:hover:bg-red-950/10",
                 submitted &&
                   isCorrectAnswer &&
                   "border-emerald-500 bg-emerald-50 dark:bg-emerald-950/40 text-emerald-800 dark:text-emerald-200",
@@ -589,7 +816,7 @@ function SATACard({
                   "shrink-0 w-5 h-5 rounded border text-xs flex items-center justify-center font-semibold mt-0.5 transition-all",
                   !submitted &&
                     isSelected &&
-                    "border-violet-500 bg-violet-500 text-white",
+                    "border-red-500 bg-red-500 text-white",
                   !submitted &&
                     !isSelected &&
                     "border-muted-foreground/40 text-muted-foreground",
@@ -623,7 +850,7 @@ function SATACard({
           size="sm"
           onClick={() => onSubmit(msg.id)}
           disabled={selected.length === 0}
-          className="bg-violet-600 hover:bg-violet-700 text-white text-xs"
+          className="bg-red-600 hover:bg-red-700 text-white text-xs"
         >
           Submit answer
         </Button>
@@ -679,14 +906,35 @@ function ScoreBadge({ correct, total }: { correct: number; total: number }) {
 
 // ─── Landing Screen ───────────────────────────────────────────────────────────
 
-function LandingScreen({ onSelect }: { onSelect: (role: "student" | "teacher") => void }) {
+function LandingScreen({ onSelect, isDark, onToggleDark }: {
+  onSelect: (role: "student" | "teacher") => void;
+  isDark: boolean;
+  onToggleDark: () => void;
+}) {
   return (
-    <div className="min-h-screen bg-gradient-to-br from-slate-100 via-white to-white font-sans flex flex-col items-center justify-center px-6">
+    <div className="min-h-screen bg-gradient-to-br from-slate-100 via-white to-white dark:from-slate-900 dark:via-slate-800 dark:to-slate-900 font-sans flex flex-col items-center justify-center px-6">
+
+      {/* Dark mode toggle — top right */}
+      <button
+        onClick={onToggleDark}
+        className="fixed top-4 right-4 w-9 h-9 rounded-full flex items-center justify-center border border-border bg-background/80 backdrop-blur hover:bg-muted transition-colors shadow-sm"
+        title={isDark ? "Switch to light mode" : "Switch to dark mode"}
+      >
+        {isDark ? (
+          <svg xmlns="http://www.w3.org/2000/svg" className="w-4 h-4 text-amber-400" viewBox="0 0 24 24" fill="currentColor">
+            <path d="M12 2.25a.75.75 0 01.75.75v2.25a.75.75 0 01-1.5 0V3a.75.75 0 01.75-.75zM7.5 12a4.5 4.5 0 119 0 4.5 4.5 0 01-9 0zM18.894 6.166a.75.75 0 00-1.06-1.06l-1.591 1.59a.75.75 0 101.06 1.061l1.591-1.59zM21.75 12a.75.75 0 01-.75.75h-2.25a.75.75 0 010-1.5H21a.75.75 0 01.75.75zM17.834 18.894a.75.75 0 001.06-1.06l-1.59-1.591a.75.75 0 10-1.061 1.06l1.59 1.591zM12 18a.75.75 0 01.75.75V21a.75.75 0 01-1.5 0v-2.25A.75.75 0 0112 18zM7.166 17.834a.75.75 0 00-1.06 1.06l1.59 1.591a.75.75 0 001.061-1.06l-1.59-1.591zM6 12a.75.75 0 01-.75.75H3a.75.75 0 010-1.5h2.25A.75.75 0 016 12zM6.166 6.166a.75.75 0 011.06-1.06l1.591 1.59a.75.75 0 01-1.06 1.061L6.166 6.166z" />
+          </svg>
+        ) : (
+          <svg xmlns="http://www.w3.org/2000/svg" className="w-4 h-4 text-slate-600" viewBox="0 0 24 24" fill="currentColor">
+            <path fillRule="evenodd" d="M9.528 1.718a.75.75 0 01.162.819A8.97 8.97 0 009 6a9 9 0 009 9 8.97 8.97 0 003.463-.69.75.75 0 01.981.98 10.503 10.503 0 01-9.694 6.46c-5.799 0-10.5-4.701-10.5-10.5 0-4.368 2.667-8.112 6.46-9.694a.75.75 0 01.818.162z" clipRule="evenodd" />
+          </svg>
+        )}
+      </button>
 
       {/* Decorative blobs */}
       <div className="pointer-events-none fixed inset-0 overflow-hidden">
-        <div className="absolute -top-32 -left-32 w-96 h-96 rounded-full bg-slate-200/50 blur-3xl" />
-        <div className="absolute -bottom-32 -right-32 w-96 h-96 rounded-full bg-gray-100/80 blur-3xl" />
+        <div className="absolute -top-32 -left-32 w-96 h-96 rounded-full bg-slate-200/50 dark:bg-slate-700/30 blur-3xl" />
+        <div className="absolute -bottom-32 -right-32 w-96 h-96 rounded-full bg-gray-100/80 dark:bg-slate-600/20 blur-3xl" />
       </div>
 
       {/* Hero */}
@@ -708,9 +956,9 @@ function LandingScreen({ onSelect }: { onSelect: (role: "student" | "teacher") =
         {/* Student card */}
         <button
           onClick={() => onSelect("student")}
-          className="flex-1 group rounded-2xl border border-border/60 bg-white shadow-md hover:shadow-xl hover:border-brand-300 hover:-translate-y-0.5 transition-all duration-200 p-7 text-left space-y-4"
+          className="flex-1 group rounded-2xl border border-border/60 bg-card shadow-md hover:shadow-xl hover:border-brand-300 hover:-translate-y-0.5 transition-all duration-200 p-7 text-left space-y-4"
         >
-          <div className="w-12 h-12 rounded-xl bg-brand-50 border border-brand-100 flex items-center justify-center text-2xl shadow-sm">
+          <div className="w-12 h-12 rounded-xl bg-brand-50 dark:bg-brand-950/30 border border-brand-100 dark:border-brand-900 flex items-center justify-center text-2xl shadow-sm">
             🎓
           </div>
           <div>
@@ -727,9 +975,9 @@ function LandingScreen({ onSelect }: { onSelect: (role: "student" | "teacher") =
         {/* Teacher card */}
         <button
           onClick={() => onSelect("teacher")}
-          className="flex-1 group rounded-2xl border border-border/60 bg-white shadow-md hover:shadow-xl hover:border-brand-300 hover:-translate-y-0.5 transition-all duration-200 p-7 text-left space-y-4"
+          className="flex-1 group rounded-2xl border border-border/60 bg-card shadow-md hover:shadow-xl hover:border-brand-300 hover:-translate-y-0.5 transition-all duration-200 p-7 text-left space-y-4"
         >
-          <div className="w-12 h-12 rounded-xl bg-slate-50 border border-slate-100 flex items-center justify-center text-2xl shadow-sm">
+          <div className="w-12 h-12 rounded-xl bg-muted border border-border flex items-center justify-center text-2xl shadow-sm">
             📋
           </div>
           <div>
@@ -750,16 +998,54 @@ function LandingScreen({ onSelect }: { onSelect: (role: "student" | "teacher") =
 // ─── Root ─────────────────────────────────────────────────────────────────────
 
 export default function App() {
-  const [view, setView] = useState<"landing" | "student" | "teacher">("landing");
+  const [view, setView] = useState<"landing" | "student" | "teacher" | "case" | "preview">("landing");
+  const [previewCase, setPreviewCase] = useState<CaseTree | null>(null);
+  const [isDark, toggleDark] = useDarkMode();
 
-  if (view === "landing") return <LandingScreen onSelect={setView} />;
-  if (view === "teacher") return <TeacherDashboard onBack={() => setView("landing")} />;
-  return <StudentTutor onBack={() => setView("landing")} />;
+  if (view === "landing") return <LandingScreen onSelect={(v) => setView(v)} isDark={isDark} onToggleDark={toggleDark} />;
+  if (view === "teacher") return (
+    <TeacherDashboard
+      onBack={() => setView("landing")}
+      isDark={isDark}
+      onToggleDark={toggleDark}
+      onPreviewCase={(tree) => { setPreviewCase(tree); setView("preview"); }}
+    />
+  );
+  if (view === "case") return <CaseStudyMode onBack={() => setView("student")} isDark={isDark} onToggleDark={toggleDark} />;
+  if (view === "preview") return (
+    <CaseStudyMode
+      onBack={() => { setPreviewCase(null); setView("teacher"); }}
+      isDark={isDark}
+      onToggleDark={toggleDark}
+      previewCase={previewCase}
+    />
+  );
+  return <StudentTutor onBack={() => setView("landing")} onOpenCase={() => setView("case")} isDark={isDark} onToggleDark={toggleDark} />;
 }
 
 // ─── Student Tutor ────────────────────────────────────────────────────────────
 
-function StudentTutor({ onBack }: { onBack: () => void }) {
+function DarkToggle({ isDark, onToggle }: { isDark: boolean; onToggle: () => void }) {
+  return (
+    <button
+      onClick={onToggle}
+      className="shrink-0 w-8 h-8 rounded-lg flex items-center justify-center border border-border hover:bg-muted transition-colors"
+      title={isDark ? "Switch to light mode" : "Switch to dark mode"}
+    >
+      {isDark ? (
+        <svg xmlns="http://www.w3.org/2000/svg" className="w-4 h-4 text-amber-400" viewBox="0 0 24 24" fill="currentColor">
+          <path d="M12 2.25a.75.75 0 01.75.75v2.25a.75.75 0 01-1.5 0V3a.75.75 0 01.75-.75zM7.5 12a4.5 4.5 0 119 0 4.5 4.5 0 01-9 0zM18.894 6.166a.75.75 0 00-1.06-1.06l-1.591 1.59a.75.75 0 101.06 1.061l1.591-1.59zM21.75 12a.75.75 0 01-.75.75h-2.25a.75.75 0 010-1.5H21a.75.75 0 01.75.75zM17.834 18.894a.75.75 0 001.06-1.06l-1.59-1.591a.75.75 0 10-1.061 1.06l1.59 1.591zM12 18a.75.75 0 01.75.75V21a.75.75 0 01-1.5 0v-2.25A.75.75 0 0112 18zM7.166 17.834a.75.75 0 00-1.06 1.06l1.59 1.591a.75.75 0 001.061-1.06l-1.59-1.591zM6 12a.75.75 0 01-.75.75H3a.75.75 0 010-1.5h2.25A.75.75 0 016 12zM6.166 6.166a.75.75 0 011.06-1.06l1.591 1.59a.75.75 0 01-1.06 1.061L6.166 6.166z" />
+        </svg>
+      ) : (
+        <svg xmlns="http://www.w3.org/2000/svg" className="w-4 h-4 text-slate-500" viewBox="0 0 24 24" fill="currentColor">
+          <path fillRule="evenodd" d="M9.528 1.718a.75.75 0 01.162.819A8.97 8.97 0 009 6a9 9 0 009 9 8.97 8.97 0 003.463-.69.75.75 0 01.981.98 10.503 10.503 0 01-9.694 6.46c-5.799 0-10.5-4.701-10.5-10.5 0-4.368 2.667-8.112 6.46-9.694a.75.75 0 01.818.162z" clipRule="evenodd" />
+        </svg>
+      )}
+    </button>
+  );
+}
+
+function StudentTutor({ onBack, onOpenCase, isDark, onToggleDark }: { onBack: () => void; onOpenCase: () => void; isDark: boolean; onToggleDark: () => void }) {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
@@ -779,6 +1065,13 @@ function StudentTutor({ onBack }: { onBack: () => void }) {
   const [questionMinimized, setQuestionMinimized] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // ── Case tree simulation state ──
+  const [activeCaseTree, setActiveCaseTree] = useState<CaseTree | null>(null);
+  const [activeCaseNodeId, setActiveCaseNodeId] = useState<string | null>(null);
+  const [turnsAtCurrentNode, setTurnsAtCurrentNode] = useState(0);
+  const [branchPath, setBranchPath] = useState<string[]>([]); // node IDs visited in order
+  const [showCaseTree, setShowCaseTree] = useState(false);    // post-case tree reveal
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -844,9 +1137,109 @@ function StudentTutor({ onBack }: { onBack: () => void }) {
       setLoading(true);
 
       try {
-        const { content: raw, usage } = await callGroq(newHistory, customInstructions);
+        // Build active case context for branch injection
+        const caseCtx: ActiveCaseContext | null =
+          activeCaseTree && activeCaseNodeId
+            ? { tree: activeCaseTree, currentNodeId: activeCaseNodeId, turnsAtCurrentNode }
+            : null;
+
+        const { content: rawFull, usage } = await callGroq(newHistory, customInstructions, 0, caseCtx);
         setTokenUsage(prev => ({ last: usage.total_tokens, session: prev.session + usage.total_tokens }));
+
+        // ── Parse and strip [BRANCH: ...] tag ──
+        const branchMatch = BRANCH_REGEX.exec(rawFull);
+        // ── Parse and strip [MEDIA: ...] tag ──
+        const mediaMatch = MEDIA_REGEX.exec(rawFull);
+        const raw = rawFull.replace(BRANCH_REGEX, "").replace(MEDIA_REGEX, "").trim();
+
         setHistory((h) => [...h, { role: "assistant", content: raw }]);
+
+        // Advance branch state if valid match with confidence ≥ 60
+        let branchAdvanced = false;
+        if (branchMatch && activeCaseTree && activeCaseNodeId) {
+          const branchId = branchMatch[1];
+          const confidence = parseInt(branchMatch[2] ?? "0", 10);
+          if (branchId !== "null" && confidence >= 60) {
+            const branch = activeCaseTree.branches.find(
+              (b) => b.id === branchId && b.fromNodeId === activeCaseNodeId
+            );
+            if (branch) {
+              setActiveCaseNodeId(branch.toNodeId);
+              setBranchPath((prev) => [...prev, branch.toNodeId]);
+              setTurnsAtCurrentNode(0);
+              branchAdvanced = true;
+            }
+          } else if (!branchMatch[2]) {
+            console.debug("[NurseTutor] Branch tag missing confidence:", branchMatch[0]);
+          }
+        }
+        // Increment turn counter if still on same node
+        if (!branchAdvanced && activeCaseTree) {
+          setTurnsAtCurrentNode((t) => t + 1);
+        }
+
+        // ── Handle media display ──
+        if (mediaMatch && activeCaseTree) {
+          const keyword = mediaMatch[1];
+          const mediaFile = activeCaseTree.mediaFiles?.find((m) => m.triggerKeyword === keyword);
+          if (mediaFile) {
+            const dataUrl = loadMediaDataUrl(activeCaseTree.id, mediaFile.id);
+            if (dataUrl) {
+              setMessages((prev) => [
+                ...prev,
+                {
+                  id: uid(),
+                  role: "assistant" as const,
+                  type: "media" as const,
+                  caption: mediaFile.description ?? mediaFile.name,
+                  mediaType: mediaFile.type,
+                  dataUrl,
+                  name: mediaFile.name,
+                },
+              ]);
+            }
+          }
+        }
+
+        // Detect case ending — show tree reveal
+        if (raw.includes("CASE SUMMARY") && activeCaseTree) {
+          setShowCaseTree(true);
+        }
+
+        // Detect case start — wire up the published case tree from library if available
+        if (raw.includes("CASE START") && !activeCaseTree) {
+          const library = loadCaseLibrary();
+          // Prefer published case, fall back to first case
+          const tree = library.find((c) => c.publishedToStudents) ?? library[0];
+          if (tree) {
+            const root = tree.nodes.find((n) => n.isRoot);
+            if (root) {
+              setActiveCaseTree(tree);
+              setActiveCaseNodeId(root.id);
+              setTurnsAtCurrentNode(0);
+              setBranchPath([root.id]);
+              setShowCaseTree(false);
+            }
+          }
+        }
+
+        // Compute citation pills — only show if the top chunk has a meaningful relevance score
+        const CITATION_MIN_SCORE = 3;
+        const _studentPool = loadPool();
+        const _publishedPool = loadPublishedPool();
+        let usedSources: NonNullable<TextMessage["sources"]> = [];
+        if (_studentPool.length > 0 || _publishedPool.length > 0) {
+          const _kw = queryKeywords(text);
+          const topScored = (pool: PooledChunk[], tier: "student" | "teacher") => {
+            if (pool.length === 0 || _kw.size === 0) return [];
+            const best = pool
+              .map((c) => ({ c, score: scoreChunk(c, _kw) }))
+              .sort((a, b) => b.score - a.score)[0];
+            if (!best || best.score < CITATION_MIN_SCORE) return [];
+            return [{ source: best.c.source, label: best.c.label, tier }];
+          };
+          usedSources = [...topScored(_studentPool, "student"), ...topScored(_publishedPool, "teacher")];
+        }
 
         const batch = parseBatch(raw);
         if (batch.length > 0) {
@@ -854,7 +1247,7 @@ function StudentTutor({ onBack }: { onBack: () => void }) {
         } else {
           setMessages((prev) => [
             ...prev,
-            { id: uid(), role: "assistant", type: "text", content: raw },
+            { id: uid(), role: "assistant", type: "text", content: raw, sources: usedSources.length > 0 ? usedSources : undefined },
           ]);
         }
       } catch (err) {
@@ -875,7 +1268,7 @@ function StudentTutor({ onBack }: { onBack: () => void }) {
         setLoading(false);
       }
     },
-    [loading, history, customInstructions]
+    [loading, history, customInstructions, activeCaseTree, activeCaseNodeId, turnsAtCurrentNode]
   );
 
   const answerMCQ = useCallback(
@@ -926,6 +1319,33 @@ function StudentTutor({ onBack }: { onBack: () => void }) {
     );
   }, []);
 
+  // Keyboard shortcuts: 1/2/3/4 for MCQ, 1-5 + Enter for SATA
+  // Must be declared after answerMCQ, toggleSATA, submitSATA
+  useEffect(() => {
+    const handleKey = (e: KeyboardEvent) => {
+      const tag = (e.target as HTMLElement).tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA") return;
+      if (questionMinimized || questionMessages.length === 0) return;
+
+      const current = questionMessages[questionIndex];
+
+      if (current?.type === "mcq" && current.chosen === undefined) {
+        const map: Record<string, "A" | "B" | "C" | "D"> = { "1": "A", "2": "B", "3": "C", "4": "D" };
+        if (map[e.key]) { e.preventDefault(); answerMCQ(current.id, map[e.key]); }
+      }
+
+      if (current?.type === "sata" && !current.submitted) {
+        const sataMap: Record<string, "A" | "B" | "C" | "D" | "E"> = {
+          "1": "A", "2": "B", "3": "C", "4": "D", "5": "E",
+        };
+        if (sataMap[e.key]) { e.preventDefault(); toggleSATA(current.id, sataMap[e.key]); }
+        if (e.key === "Enter" && current.selected.length > 0) { e.preventDefault(); submitSATA(current.id); }
+      }
+    };
+    window.addEventListener("keydown", handleKey);
+    return () => window.removeEventListener("keydown", handleKey);
+  }, [questionMessages, questionIndex, questionMinimized, answerMCQ, toggleSATA, submitSATA]);
+
   const handleFileUpload = useCallback(
     async (e: React.ChangeEvent<HTMLInputElement>) => {
       const files = Array.from(e.target.files ?? []);
@@ -952,9 +1372,11 @@ function StudentTutor({ onBack }: { onBack: () => void }) {
           const pool = loadPool();
           savePool([...pool.filter((c) => c.source !== file.name), ...pooled]);
           added.push({ name: file.name, count: chunks.length });
-        } catch {
+        } catch (err) {
+          const reason = err instanceof Error ? err.message : String(err);
+          console.error("File upload error:", reason);
           setMessages((prev) => [...prev, { id: uid(), role: "assistant", type: "text",
-            content: `Sorry, I couldn't read ${file.name}. Try .txt, .md, .pdf, .docx, .pptx, or an image (jpg, png).` }]);
+            content: `Sorry, I couldn't read ${file.name}: ${reason}` }]);
         }
       }
       setUploadingFile(null);
@@ -982,9 +1404,9 @@ function StudentTutor({ onBack }: { onBack: () => void }) {
   );
 
   return (
-    <div className="flex flex-col h-screen bg-background font-sans max-w-3xl mx-auto">
+    <div className="flex flex-col h-screen bg-background font-sans">
       {/* ── Header ── */}
-      <div className="shrink-0 border-b border-border px-5 py-3 flex items-center gap-3">
+      <div className="shrink-0 border-b border-border px-5 py-3 flex items-center gap-3 w-full">
         <div className="w-9 h-9 rounded-full overflow-hidden shrink-0">
           <img src="/nurse-avatar.png" alt="NurseTutor" className="w-full h-full object-cover" />
         </div>
@@ -1016,6 +1438,14 @@ function StudentTutor({ onBack }: { onBack: () => void }) {
               <span className="text-[10px] text-muted-foreground">Session: {tokenUsage.session.toLocaleString()}</span>
             </div>
           )}
+          <DarkToggle isDark={isDark} onToggle={onToggleDark} />
+          <button
+            onClick={onOpenCase}
+            className="shrink-0 flex items-center gap-1.5 text-xs font-semibold text-red-600 dark:text-red-400 border border-red-200 dark:border-red-800 rounded-lg px-2.5 h-8 hover:bg-red-50 dark:hover:bg-red-950/30 transition-all"
+            title="Open Case Study mode"
+          >
+            🏥 Case Study
+          </button>
           <button
             onClick={onBack}
             className="shrink-0 text-xs text-muted-foreground hover:text-foreground border border-border rounded-lg px-2.5 h-8 transition-all hover:border-brand-400"
@@ -1056,9 +1486,9 @@ function StudentTutor({ onBack }: { onBack: () => void }) {
 
       {/* ── Upload loading bar ── */}
       {uploadingFile && (
-        <div className="shrink-0 border-b border-brand-200 bg-brand-50 px-5 py-2 space-y-1.5">
+        <div className="shrink-0 border-b border-brand-200 dark:border-brand-900 bg-brand-50 dark:bg-brand-950/30 px-5 py-2 space-y-1.5">
           <div className="flex items-center justify-between">
-            <p className="text-xs text-brand-700 font-medium truncate max-w-xs">
+            <p className="text-xs text-brand-700 dark:text-brand-300 font-medium truncate max-w-xs">
               {uploadingFile}
             </p>
             <p className="text-xs text-brand-500 shrink-0 ml-2">
@@ -1068,7 +1498,7 @@ function StudentTutor({ onBack }: { onBack: () => void }) {
           {uploadProgress && (
             <p className="text-xs text-brand-600 truncate">{uploadProgress.message}</p>
           )}
-          <div className="h-1.5 w-full bg-brand-100 rounded-full overflow-hidden">
+          <div className="h-1.5 w-full bg-brand-100 dark:bg-brand-950 rounded-full overflow-hidden">
             <div
               className={cn(
                 "h-full bg-brand-500 rounded-full transition-all duration-300",
@@ -1205,9 +1635,9 @@ function StudentTutor({ onBack }: { onBack: () => void }) {
       )}
 
       {/* ── Chat ── */}
-      <ScrollArea className="flex-1 px-5 py-4">
-        <div className="space-y-5 pb-2">
-          {messages.filter((m) => m.type === "text").map((msg) => (
+      <ScrollArea className="flex-1">
+        <div className="max-w-3xl mx-auto px-5 py-4 space-y-5 pb-2">
+          {messages.filter((m) => m.type === "text" || m.type === "media").map((msg) => (
             <div
               key={msg.id}
               className={cn(
@@ -1222,11 +1652,62 @@ function StudentTutor({ onBack }: { onBack: () => void }) {
                   <span className="text-xs font-semibold text-muted-foreground">You</span>
                 )}
               </div>
-              <div className="rounded-2xl px-4 py-3 text-sm leading-relaxed bg-muted/60 border border-border rounded-tl-sm max-w-[82%]">
-                {msg.type === "text" && formatText(msg.content)}
-              </div>
+
+              {/* Text message */}
+              {msg.type === "text" && (
+                <div className="rounded-2xl px-4 py-3 text-sm leading-relaxed bg-muted/60 border border-border rounded-tl-sm max-w-[82%]">
+                  {formatText(msg.content)}
+                  {msg.role === "assistant" && msg.sources && msg.sources.length > 0 && (
+                    <div className="flex flex-wrap gap-1.5 mt-2 pt-2 border-t border-border/40">
+                      {msg.sources.map((s, i) => (
+                        <span key={i} className={cn(
+                          "inline-flex items-center gap-1 text-[10px] font-medium px-2 py-0.5 rounded-full border",
+                          s.tier === "student"
+                            ? "bg-brand-50 dark:bg-brand-950/40 text-brand-700 dark:text-brand-300 border-brand-200 dark:border-brand-800"
+                            : "bg-emerald-50 dark:bg-emerald-950/30 text-emerald-700 dark:text-emerald-400 border-emerald-200 dark:border-emerald-800"
+                        )}>
+                          {s.tier === "student" ? "📄" : "📚"}
+                          {s.source.length > 22 ? s.source.slice(0, 22) + "…" : s.source}
+                          {" — "}{s.label}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* Media message */}
+              {msg.type === "media" && (
+                <div className="rounded-2xl border border-border bg-card overflow-hidden shadow-sm max-w-sm">
+                  {msg.mediaType === "image" && (
+                    <img src={msg.dataUrl} alt={msg.name} className="w-full object-contain max-h-64" />
+                  )}
+                  {msg.mediaType === "audio" && (
+                    <div className="px-4 py-3 flex items-center gap-3">
+                      <span className="text-xl shrink-0">🔊</span>
+                      <div className="flex-1 min-w-0">
+                        <p className="text-xs font-semibold text-foreground truncate">{msg.caption || msg.name}</p>
+                        <audio controls src={msg.dataUrl} className="w-full mt-1.5 h-8" />
+                      </div>
+                    </div>
+                  )}
+                  {msg.caption && msg.mediaType === "image" && (
+                    <div className="px-3 py-2 border-t border-border/60">
+                      <p className="text-xs text-muted-foreground">{msg.caption}</p>
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
           ))}
+
+          {/* ── Post-case tree reveal ── */}
+          {showCaseTree && activeCaseTree && (
+            <CaseTreeReveal
+              tree={activeCaseTree}
+              visitedNodeIds={branchPath}
+            />
+          )}
 
           {loading && (
             <div className="flex gap-2.5">
@@ -1324,7 +1805,8 @@ function StudentTutor({ onBack }: { onBack: () => void }) {
       </div>
 
       {/* ── Input row ── */}
-      <div className="shrink-0 px-5 pb-5 pt-2 flex gap-2 items-center">
+      <div className="shrink-0 border-t border-border">
+      <div className="max-w-3xl mx-auto px-5 pb-5 pt-3 flex gap-2 items-center">
         <input
           ref={fileInputRef}
           type="file"
@@ -1379,6 +1861,7 @@ function StudentTutor({ onBack }: { onBack: () => void }) {
         >
           Send
         </Button>
+      </div>
       </div>
     </div>
   );
