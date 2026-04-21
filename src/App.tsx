@@ -18,7 +18,6 @@ function useDarkMode(): [boolean, () => void] {
 }
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { cn } from "@/lib/utils";
 import TeacherDashboard from "./TeacherDashboard";
@@ -38,6 +37,7 @@ interface TextMessage {
   type: "text";
   content: string;
   sources?: Array<{ source: string; label: string; tier: "student" | "teacher" }>;
+  createdAt?: number;
 }
 
 interface MCQMessage {
@@ -71,6 +71,7 @@ interface MediaMessage {
   mediaType: "image" | "audio";
   dataUrl: string;
   name: string;
+  createdAt?: number;
 }
 
 type Message = TextMessage | MCQMessage | SATAMessage | MediaMessage;
@@ -658,6 +659,10 @@ const MEDIA_REGEX = /\[MEDIA:\s*([\w-]+)\s*\]/;
 
 // ─── Sub-components ───────────────────────────────────────────────────────────
 
+function formatTimestamp(ts: number): string {
+  return new Date(ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
 function LoadingDots() {
   return (
     <div className="flex items-center gap-1 py-1">
@@ -1112,6 +1117,7 @@ function StudentTutor({ onBack, onOpenCase, isDark, onToggleDark }: { onBack: ()
       type: "text",
       content:
         "Welcome! I'm NurseTutor — your nursing classroom assistant.\n\nI can:\n• Explain any topic from your course material\n• Answer questions about specific content\n• Summarize key concepts\n• Generate NCLEX-style practice questions (MCQ & SATA)\n\nYour professor may have already loaded course materials — just ask me anything. You can also upload your own notes or slides using the panel on the left.\n\nTip: Use the Instructions button in the top right to set your focus area, difficulty level, or any other preferences.",
+      createdAt: Date.now(),
     };
     setMessages([welcome]);
   }, []);
@@ -1126,6 +1132,7 @@ function StudentTutor({ onBack, onOpenCase, isDark, onToggleDark }: { onBack: ()
         role: "user",
         type: "text",
         content: text,
+        createdAt: Date.now(),
       };
       setMessages((prev) => [...prev, userMsg]);
 
@@ -1195,6 +1202,7 @@ function StudentTutor({ onBack, onOpenCase, isDark, onToggleDark }: { onBack: ()
                   mediaType: mediaFile.type,
                   dataUrl,
                   name: mediaFile.name,
+                  createdAt: Date.now(),
                 },
               ]);
             }
@@ -1247,7 +1255,7 @@ function StudentTutor({ onBack, onOpenCase, isDark, onToggleDark }: { onBack: ()
         } else {
           setMessages((prev) => [
             ...prev,
-            { id: uid(), role: "assistant", type: "text", content: raw, sources: usedSources.length > 0 ? usedSources : undefined },
+            { id: uid(), role: "assistant", type: "text", content: raw, sources: usedSources.length > 0 ? usedSources : undefined, createdAt: Date.now() },
           ]);
         }
       } catch (err) {
@@ -1262,6 +1270,7 @@ function StudentTutor({ onBack, onOpenCase, isDark, onToggleDark }: { onBack: ()
             content: errMsg.includes("429")
               ? "You're sending requests too quickly — please wait a few seconds and try again."
               : `Sorry, I had trouble connecting. (${errMsg})`,
+            createdAt: Date.now(),
           },
         ]);
       } finally {
@@ -1641,7 +1650,7 @@ function StudentTutor({ onBack, onOpenCase, isDark, onToggleDark }: { onBack: ()
             <div
               key={msg.id}
               className={cn(
-                "flex gap-2.5",
+                "flex gap-2.5 group",
                 msg.role === "user" && "flex-row-reverse"
               )}
             >
@@ -1653,51 +1662,61 @@ function StudentTutor({ onBack, onOpenCase, isDark, onToggleDark }: { onBack: ()
                 )}
               </div>
 
-              {/* Text message */}
-              {msg.type === "text" && (
-                <div className="rounded-2xl px-4 py-3 text-sm leading-relaxed bg-muted/60 border border-border rounded-tl-sm max-w-[82%]">
-                  {formatText(msg.content)}
-                  {msg.role === "assistant" && msg.sources && msg.sources.length > 0 && (
-                    <div className="flex flex-wrap gap-1.5 mt-2 pt-2 border-t border-border/40">
-                      {msg.sources.map((s, i) => (
-                        <span key={i} className={cn(
-                          "inline-flex items-center gap-1 text-[10px] font-medium px-2 py-0.5 rounded-full border",
-                          s.tier === "student"
-                            ? "bg-brand-50 dark:bg-brand-950/40 text-brand-700 dark:text-brand-300 border-brand-200 dark:border-brand-800"
-                            : "bg-emerald-50 dark:bg-emerald-950/30 text-emerald-700 dark:text-emerald-400 border-emerald-200 dark:border-emerald-800"
-                        )}>
-                          {s.tier === "student" ? "📄" : "📚"}
-                          {s.source.length > 22 ? s.source.slice(0, 22) + "…" : s.source}
-                          {" — "}{s.label}
-                        </span>
-                      ))}
-                    </div>
-                  )}
-                </div>
-              )}
-
-              {/* Media message */}
-              {msg.type === "media" && (
-                <div className="rounded-2xl border border-border bg-card overflow-hidden shadow-sm max-w-sm">
-                  {msg.mediaType === "image" && (
-                    <img src={msg.dataUrl} alt={msg.name} className="w-full object-contain max-h-64" />
-                  )}
-                  {msg.mediaType === "audio" && (
-                    <div className="px-4 py-3 flex items-center gap-3">
-                      <span className="text-xl shrink-0">🔊</span>
-                      <div className="flex-1 min-w-0">
-                        <p className="text-xs font-semibold text-foreground truncate">{msg.caption || msg.name}</p>
-                        <audio controls src={msg.dataUrl} className="w-full mt-1.5 h-8" />
+              {/* Bubble + timestamp wrapper */}
+              <div className={cn("flex flex-col gap-0.5 max-w-[82%]", msg.role === "user" && "items-end")}>
+                {/* Text message */}
+                {msg.type === "text" && (
+                  <div className="rounded-2xl px-4 py-3 text-sm leading-relaxed bg-muted/60 border border-border rounded-tl-sm">
+                    {formatText(msg.content)}
+                    {msg.role === "assistant" && msg.sources && msg.sources.length > 0 && (
+                      <div className="flex flex-wrap gap-1.5 mt-2 pt-2 border-t border-border/40">
+                        {msg.sources.map((s, i) => (
+                          <span key={i} className={cn(
+                            "inline-flex items-center gap-1 text-[10px] font-medium px-2 py-0.5 rounded-full border",
+                            s.tier === "student"
+                              ? "bg-brand-50 dark:bg-brand-950/40 text-brand-700 dark:text-brand-300 border-brand-200 dark:border-brand-800"
+                              : "bg-emerald-50 dark:bg-emerald-950/30 text-emerald-700 dark:text-emerald-400 border-emerald-200 dark:border-emerald-800"
+                          )}>
+                            {s.tier === "student" ? "📄" : "📚"}
+                            {s.source.length > 22 ? s.source.slice(0, 22) + "…" : s.source}
+                            {" — "}{s.label}
+                          </span>
+                        ))}
                       </div>
-                    </div>
-                  )}
-                  {msg.caption && msg.mediaType === "image" && (
-                    <div className="px-3 py-2 border-t border-border/60">
-                      <p className="text-xs text-muted-foreground">{msg.caption}</p>
-                    </div>
-                  )}
-                </div>
-              )}
+                    )}
+                  </div>
+                )}
+
+                {/* Media message */}
+                {msg.type === "media" && (
+                  <div className="rounded-2xl border border-border bg-card overflow-hidden shadow-sm max-w-sm">
+                    {msg.mediaType === "image" && (
+                      <img src={msg.dataUrl} alt={msg.name} className="w-full object-contain max-h-64" />
+                    )}
+                    {msg.mediaType === "audio" && (
+                      <div className="px-4 py-3 flex items-center gap-3">
+                        <span className="text-xl shrink-0">🔊</span>
+                        <div className="flex-1 min-w-0">
+                          <p className="text-xs font-semibold text-foreground truncate">{msg.caption || msg.name}</p>
+                          <audio controls src={msg.dataUrl} className="w-full mt-1.5 h-8" />
+                        </div>
+                      </div>
+                    )}
+                    {msg.caption && msg.mediaType === "image" && (
+                      <div className="px-3 py-2 border-t border-border/60">
+                        <p className="text-xs text-muted-foreground">{msg.caption}</p>
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {/* Timestamp — fades in on hover */}
+                {"createdAt" in msg && msg.createdAt && (
+                  <span className="text-[10px] text-muted-foreground opacity-0 group-hover:opacity-100 transition-opacity duration-150 px-1">
+                    {formatTimestamp(msg.createdAt)}
+                  </span>
+                )}
+              </div>
             </div>
           ))}
 
@@ -1714,8 +1733,13 @@ function StudentTutor({ onBack, onOpenCase, isDark, onToggleDark }: { onBack: ()
               <div className="shrink-0 w-7 h-7 rounded-full overflow-hidden">
                 <img src="/nurse-avatar.png" alt="NurseTutor" className="w-full h-full object-cover" />
               </div>
-              <div className="bg-muted/60 border border-border rounded-2xl rounded-tl-sm px-4 py-3">
-                <LoadingDots />
+              <div className="flex flex-col gap-0.5">
+                <div className="bg-muted/60 border border-border rounded-2xl rounded-tl-sm px-4 py-3">
+                  <div className="flex items-center gap-2">
+                    <LoadingDots />
+                    <span className="text-xs text-muted-foreground">NurseTutor is typing…</span>
+                  </div>
+                </div>
               </div>
             </div>
           )}
@@ -1806,62 +1830,88 @@ function StudentTutor({ onBack, onOpenCase, isDark, onToggleDark }: { onBack: ()
 
       {/* ── Input row ── */}
       <div className="shrink-0 border-t border-border">
-      <div className="max-w-3xl mx-auto px-5 pb-5 pt-3 flex gap-2 items-center">
-        <input
-          ref={fileInputRef}
-          type="file"
-          accept=".txt,.md,.csv,.rtf,.pdf,.docx,.pptx,.png,.jpg,.jpeg,.webp,.gif"
-          multiple
-          className="hidden"
-          onChange={handleFileUpload}
-        />
-        <button
-          onClick={() => fileInputRef.current?.click()}
-          title="Upload study notes (.txt, .md, .pdf, .docx, .pptx, or images)"
-          className={cn(
-            "shrink-0 w-9 h-9 rounded-lg border flex items-center justify-center transition-all",
-            uploadedDocs.length > 0
-              ? "border-brand-500 bg-brand-50 text-brand-600 dark:bg-brand-950/30"
-              : "border-border text-muted-foreground hover:border-brand-400 hover:text-brand-600"
-          )}
-        >
-          <svg viewBox="0 0 16 16" fill="none" className="w-4 h-4">
-            <path
-              d="M2 10v3a1 1 0 001 1h10a1 1 0 001-1v-3M8 2v8M5 5l3-3 3 3"
-              stroke="currentColor"
-              strokeWidth="1.4"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-            />
-          </svg>
-        </button>
+        <div className="max-w-3xl mx-auto px-5 pb-3 pt-3 flex gap-2 items-end">
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept=".txt,.md,.csv,.rtf,.pdf,.docx,.pptx,.png,.jpg,.jpeg,.webp,.gif"
+            multiple
+            className="hidden"
+            onChange={handleFileUpload}
+          />
+          <button
+            onClick={() => fileInputRef.current?.click()}
+            title="Upload study notes (.txt, .md, .pdf, .docx, .pptx, or images)"
+            className={cn(
+              "shrink-0 w-9 h-9 rounded-lg border flex items-center justify-center transition-all mb-0.5",
+              uploadedDocs.length > 0
+                ? "border-brand-500 bg-brand-50 text-brand-600 dark:bg-brand-950/30"
+                : "border-border text-muted-foreground hover:border-brand-400 hover:text-brand-600"
+            )}
+          >
+            <svg viewBox="0 0 16 16" fill="none" className="w-4 h-4">
+              <path
+                d="M2 10v3a1 1 0 001 1h10a1 1 0 001-1v-3M8 2v8M5 5l3-3 3 3"
+                stroke="currentColor"
+                strokeWidth="1.4"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              />
+            </svg>
+          </button>
 
-        <Input
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter" && !e.shiftKey) {
-              e.preventDefault();
-              send(input);
-            }
-          }}
-          placeholder={
-            uploadedDocs.length > 0
-              ? `Ask about your ${uploadedDocs.length} uploaded file${uploadedDocs.length !== 1 ? "s" : ""}…`
-              : "Ask a question or request a quiz…"
-          }
-          disabled={loading}
-          className="flex-1 rounded-lg text-sm"
-        />
-        <Button
-          onClick={() => send(input)}
-          disabled={loading || !input.trim()}
-          size="sm"
-          className="bg-brand-600 hover:bg-brand-700 text-white rounded-lg px-4"
-        >
-          Send
-        </Button>
-      </div>
+          {/* Textarea with character count */}
+          <div className="flex-1 relative">
+            <textarea
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && !e.shiftKey) {
+                  e.preventDefault();
+                  send(input);
+                }
+              }}
+              placeholder={
+                uploadedDocs.length > 0
+                  ? `Ask about your ${uploadedDocs.length} uploaded file${uploadedDocs.length !== 1 ? "s" : ""}…`
+                  : "Ask a question or request a quiz…"
+              }
+              disabled={loading}
+              rows={1}
+              className="w-full resize-none rounded-lg text-sm border border-input bg-background px-3 py-2 ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 min-h-[36px] max-h-[120px] overflow-y-auto leading-relaxed"
+              style={{ height: "36px" }}
+              onInput={(e) => {
+                const el = e.currentTarget;
+                el.style.height = "36px";
+                el.style.height = Math.min(el.scrollHeight, 120) + "px";
+              }}
+            />
+            {input.length > 100 && (
+              <span className={cn(
+                "absolute bottom-1.5 right-2.5 text-[10px] pointer-events-none select-none",
+                input.length > 1800 ? "text-red-500" :
+                input.length > 1400 ? "text-amber-500" :
+                "text-muted-foreground/40"
+              )}>
+                {input.length}
+              </span>
+            )}
+          </div>
+
+          <Button
+            onClick={() => send(input)}
+            disabled={loading || !input.trim()}
+            size="sm"
+            className="bg-brand-600 hover:bg-brand-700 text-white rounded-lg px-4 mb-0.5"
+          >
+            Send
+          </Button>
+        </div>
+        <div className="max-w-3xl mx-auto px-5 pb-3 flex justify-end">
+          <span className="text-[10px] text-muted-foreground/40 select-none">
+            Enter ↵ send · Shift+Enter new line
+          </span>
+        </div>
       </div>
     </div>
   );
