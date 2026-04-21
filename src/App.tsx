@@ -1662,8 +1662,8 @@ function StudentTutor({ onBack, onOpenCase, isDark, onToggleDark }: { onBack: ()
                 )}
               </div>
 
-              {/* Bubble + timestamp wrapper */}
-              <div className={cn("flex flex-col gap-0.5 max-w-[82%]", msg.role === "user" && "items-end")}>
+              {/* Bubble + timestamp wrapper — timestamp is absolutely positioned so it never adds height */}
+              <div className="relative max-w-[82%]">
                 {/* Text message */}
                 {msg.type === "text" && (
                   <div className="rounded-2xl px-4 py-3 text-sm leading-relaxed bg-muted/60 border border-border rounded-tl-sm">
@@ -1710,9 +1710,12 @@ function StudentTutor({ onBack, onOpenCase, isDark, onToggleDark }: { onBack: ()
                   </div>
                 )}
 
-                {/* Timestamp — fades in on hover */}
+                {/* Timestamp — absolutely positioned below bubble, zero layout impact */}
                 {"createdAt" in msg && msg.createdAt && (
-                  <span className="text-[10px] text-muted-foreground opacity-0 group-hover:opacity-100 transition-opacity duration-150 px-1">
+                  <span className={cn(
+                    "absolute -bottom-4 text-[10px] text-muted-foreground/70 whitespace-nowrap opacity-0 group-hover:opacity-100 transition-opacity duration-150",
+                    msg.role === "user" ? "right-1" : "left-1"
+                  )}>
                     {formatTimestamp(msg.createdAt)}
                   </span>
                 )}
@@ -1830,7 +1833,7 @@ function StudentTutor({ onBack, onOpenCase, isDark, onToggleDark }: { onBack: ()
 
       {/* ── Input row ── */}
       <div className="shrink-0 border-t border-border">
-        <div className="max-w-3xl mx-auto px-5 pb-3 pt-3 flex gap-2 items-end">
+        <div className="max-w-3xl mx-auto px-5 pb-3 pt-3 flex gap-2 items-center">
           <input
             ref={fileInputRef}
             type="file"
@@ -1843,7 +1846,7 @@ function StudentTutor({ onBack, onOpenCase, isDark, onToggleDark }: { onBack: ()
             onClick={() => fileInputRef.current?.click()}
             title="Upload study notes (.txt, .md, .pdf, .docx, .pptx, or images)"
             className={cn(
-              "shrink-0 w-9 h-9 rounded-lg border flex items-center justify-center transition-all mb-0.5",
+              "shrink-0 w-9 h-9 rounded-lg border flex items-center justify-center transition-all",
               uploadedDocs.length > 0
                 ? "border-brand-500 bg-brand-50 text-brand-600 dark:bg-brand-950/30"
                 : "border-border text-muted-foreground hover:border-brand-400 hover:text-brand-600"
@@ -1878,7 +1881,7 @@ function StudentTutor({ onBack, onOpenCase, isDark, onToggleDark }: { onBack: ()
               }
               disabled={loading}
               rows={1}
-              className="w-full resize-none rounded-lg text-sm border border-input bg-background px-3 py-2 ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 min-h-[36px] max-h-[120px] overflow-y-auto leading-relaxed"
+              className="w-full resize-none rounded-lg text-sm border border-input bg-background px-3 py-2 ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 min-h-[36px] max-h-[120px] overflow-y-auto"
               style={{ height: "36px" }}
               onInput={(e) => {
                 const el = e.currentTarget;
@@ -1902,7 +1905,7 @@ function StudentTutor({ onBack, onOpenCase, isDark, onToggleDark }: { onBack: ()
             onClick={() => send(input)}
             disabled={loading || !input.trim()}
             size="sm"
-            className="bg-brand-600 hover:bg-brand-700 text-white rounded-lg px-4 mb-0.5"
+            className="bg-brand-600 hover:bg-brand-700 text-white rounded-lg px-4"
           >
             Send
           </Button>
