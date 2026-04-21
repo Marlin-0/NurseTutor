@@ -123,6 +123,7 @@ CASE: ${tree.title}${tree.diagnosis ? `\nDIAGNOSIS CONTEXT: ${tree.diagnosis}` :
         .join("\n\n");
   }
 
+  const hintsEnabled = tree.hintsEnabled ?? false;
   prompt += `\n\n━━━ SIMULATION RULES ━━━
 - Respond in character as the clinical environment. Be realistic, specific, clinical.
 - Use the patient profile above to give consistent, accurate responses throughout the simulation.
@@ -131,7 +132,11 @@ CASE: ${tree.title}${tree.diagnosis ? `\nDIAGNOSIS CONTEXT: ${tree.diagnosis}` :
 - When the student completes the case or you reach a natural end, write CASE SUMMARY on its own line.
 - CRITICAL — Do NOT guide, hint, or suggest actions to the student. Never say "you might want to...", "have you considered...", "it would be a good idea to...", or anything similar. The student must think for themselves.
 - You are REACTIVE only: describe findings when the student performs an assessment, answer questions when asked, present deterioration when it occurs. Never volunteer what the student should do next.
-- Present the clinical picture honestly and in real time. The student determines their own priorities.`;
+- Present the clinical picture honestly and in real time. The student determines their own priorities.
+━━━ HINT POLICY ━━━
+${hintsEnabled
+  ? `Hints are ENABLED for this case. If the student explicitly asks for a hint (says "hint", "I need help", "I'm stuck", "what should I do", etc.), you may provide ONE short, specific nudge that points them in the right direction without giving the answer. Frame it as an observation from the environment, not direct instruction. Only give a hint when explicitly asked — never volunteer one.`
+  : `Hints are DISABLED for this case. If the student asks for a hint or says they are stuck, politely tell them hints are not available for this case and they need to think through it themselves. Do not provide any guidance.`}`;
 
   if (currentNode) {
     if (currentNode.situation) {

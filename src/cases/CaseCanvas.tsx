@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { cn } from "@/lib/utils";
 import type { CaseTree, CaseNode, CaseBranch, NodeConsequence } from "../types/case";
 import { defaultPatientProfile } from "../types/case";
@@ -296,6 +296,12 @@ function TrainTrackCanvas({
   connectingFrom,
   connectExistingNode,
   onCancelConnect,
+  draggingNodeId,
+  dropTargetNodeId,
+  onDragStart,
+  onDragOver,
+  onDrop,
+  onDragEnd,
 }: {
   nodes: CaseNode[];
   branches: CaseBranch[];
@@ -307,6 +313,12 @@ function TrainTrackCanvas({
   connectingFrom: string | null;
   connectExistingNode: (toNodeId: string) => void;
   onCancelConnect: () => void;
+  draggingNodeId: string | null;
+  dropTargetNodeId: string | null;
+  onDragStart: (id: string) => void;
+  onDragOver: (id: string) => void;
+  onDrop: (draggedId: string, targetId: string) => void;
+  onDragEnd: () => void;
 }) {
   const mainChain = getMainTrackChain(nodes, branches);
   const mainTrackNodeIds = new Set(mainChain.map(n => n.id));
@@ -393,11 +405,18 @@ function TrainTrackCanvas({
             const connectState: ConnectState =
               connectingFrom ? (node.id === connectingFrom ? "source" : "target") : "normal";
             const incomingReconnects = reconnectsByTarget.get(node.id) ?? [];
+            const isDropTarget = dropTargetNodeId === node.id && draggingNodeId !== node.id;
 
             return (
               // Single flex-row per spine node — no outer wrapper needed
               // self-stretch on left column lets the connector fill the full row height
-              <div key={node.id} className="flex flex-row items-start" onClick={e => e.stopPropagation()}>
+              <div
+                key={node.id}
+                className="flex flex-row items-start"
+                onClick={e => e.stopPropagation()}
+                onDragOver={e => { e.preventDefault(); onDragOver(node.id); }}
+                onDrop={e => { e.preventDefault(); if (draggingNodeId) onDrop(draggingNodeId, node.id); }}
+              >
 
                 {/* ── Left spine column ── fixed width, stretches to fill row height */}
                 <div className="w-40 shrink-0 flex flex-col items-center self-stretch">
@@ -420,16 +439,45 @@ function TrainTrackCanvas({
                     </div>
                   )}
 
-                  <NodeCard
-                    node={node}
-                    selected={isSelected}
-                    isMainTrack={true}
-                    connectState={connectState}
-                    onClick={() => {
-                      if (connectingFrom) connectExistingNode(node.id);
-                      else onSelectNode(node.id);
-                    }}
-                  />
+                  {/* Drop indicator */}
+                  {isDropTarget && (
+                    <div className="w-full h-0.5 bg-brand-500 rounded-full mb-1 shadow-sm" />
+                  )}
+
+                  {/* Drag handle + NodeCard row */}
+                  <div
+                    className={cn(
+                      "flex items-center gap-1 w-full transition-opacity",
+                      draggingNodeId === node.id && "opacity-40"
+                    )}
+                    draggable={!connectingFrom}
+                    onDragStart={() => onDragStart(node.id)}
+                    onDragEnd={onDragEnd}
+                  >
+                    {/* Drag grip — only visible on hover of the row */}
+                    <div
+                      className="group/drag shrink-0 cursor-grab active:cursor-grabbing flex flex-col items-center gap-0.5 px-0.5 py-1 opacity-0 hover:opacity-100 focus:opacity-100"
+                      title="Drag to reorder"
+                    >
+                      {[0,1,2].map(r => (
+                        <div key={r} className="flex gap-0.5">
+                          <div className="w-0.5 h-0.5 rounded-full bg-muted-foreground/50" />
+                          <div className="w-0.5 h-0.5 rounded-full bg-muted-foreground/50" />
+                        </div>
+                      ))}
+                    </div>
+
+                    <NodeCard
+                      node={node}
+                      selected={isSelected}
+                      isMainTrack={true}
+                      connectState={connectState}
+                      onClick={() => {
+                        if (connectingFrom) connectExistingNode(node.id);
+                        else onSelectNode(node.id);
+                      }}
+                    />
+                  </div>
 
                   {/* Stretchy connector OR add-step button — fills remaining row height */}
                   {!isLastNode ? (
@@ -1111,6 +1159,84 @@ export default function CaseCanvas({
   const [caseDescription, setCaseDescription] = useState(tree.description);
   const [activeTab, setActiveTab] = useState<CanvasTab>("canvas");
 
+  // ── Undo/redo history ──
+  type Snapshot = { nodes: CaseNode[]; branches: CaseBranch[] };
+  const historyRef = useRef<Snapshot[]>([{ nodes: tree.nodes, branches: autoDetectMainTrack(tree.nodes, tree.branches) }]);
+  const historyIdxRef = useRef(0);
+  const [historyVersion, setHistoryVersion] = useState(0); // bump to re-render buttons
+
+  /** Call before any mutation to save a checkpoint */
+  function checkpoint() {
+    // Truncate any "future" (redo) history beyond current index
+    historyRef.current = historyRef.current.slice(0, historyIdxRef.current + 1);
+    historyRef.current.push({ nodes, branches });
+    if (historyRef.current.length > 50) historyRef.current.shift();
+    historyIdxRef.current = historyRef.current.length - 1;
+    setHistoryVersion(v => v + 1);
+  }
+
+  function undo() {
+    if (historyIdxRef.current <= 0) return;
+    historyIdxRef.current--;
+    const snap = historyRef.current[historyIdxRef.current];
+    setNodes(snap.nodes);
+    setBranches(snap.branches);
+    setHistoryVersion(v => v + 1);
+  }
+
+  function redo() {
+    if (historyIdxRef.current >= historyRef.current.length - 1) return;
+    historyIdxRef.current++;
+    const snap = historyRef.current[historyIdxRef.current];
+    setNodes(snap.nodes);
+    setBranches(snap.branches);
+    setHistoryVersion(v => v + 1);
+  }
+
+  const canUndo = historyVersion >= 0 && historyIdxRef.current > 0;
+  const canRedo = historyVersion >= 0 && historyIdxRef.current < historyRef.current.length - 1;
+
+  // ── Drag-to-reorder main track ──
+  const [draggingNodeId, setDraggingNodeId] = useState<string | null>(null);
+  const [dropTargetNodeId, setDropTargetNodeId] = useState<string | null>(null);
+
+  function reorderMainTrack(draggedId: string, insertBeforeId: string) {
+    if (draggedId === insertBeforeId) return;
+    const chain = getMainTrackChain(nodes, branches);
+    const draggedNode = chain.find(n => n.id === draggedId);
+    if (!draggedNode) return;
+
+    checkpoint();
+
+    // Build new chain: remove dragged, insert before target
+    const chainWithout = chain.filter(n => n.id !== draggedId);
+    const targetIdx = chainWithout.findIndex(n => n.id === insertBeforeId);
+    const insertAt = targetIdx === -1 ? chainWithout.length : targetIdx;
+    const newChain = [
+      ...chainWithout.slice(0, insertAt),
+      draggedNode,
+      ...chainWithout.slice(insertAt),
+    ];
+
+    // Rebuild main-track branches in new order
+    const nonMainBranches = branches.filter(b => !b.mainTrack);
+    const newMainBranches: CaseBranch[] = [];
+    for (let i = 0; i < newChain.length - 1; i++) {
+      const existing = branches.find(
+        b => b.fromNodeId === newChain[i].id && b.toNodeId === newChain[i + 1].id
+      );
+      newMainBranches.push(
+        existing
+          ? { ...existing, mainTrack: true }
+          : { id: uid(), fromNodeId: newChain[i].id, toNodeId: newChain[i + 1].id, label: "", triggerPhrase: "", mainTrack: true }
+      );
+    }
+
+    // Update isRoot flags
+    setNodes(prev => prev.map(n => ({ ...n, isRoot: n.id === newChain[0]?.id })));
+    setBranches([...nonMainBranches, ...newMainBranches]);
+  }
+
   // Sync up to parent on every mutation
   useEffect(() => {
     onChange({
@@ -1125,13 +1251,17 @@ export default function CaseCanvas({
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [nodes, branches, caseTitle, caseDiagnosis, caseDescription]);
 
-  // Escape cancels connect mode
+  // Escape cancels connect mode; Cmd/Ctrl+Z = undo; Cmd/Ctrl+Shift+Z = redo
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
-      if (e.key === "Escape") setConnectingFrom(null);
+      if (e.key === "Escape") { setConnectingFrom(null); return; }
+      const mod = e.metaKey || e.ctrlKey;
+      if (mod && e.key === "z" && !e.shiftKey) { e.preventDefault(); undo(); return; }
+      if (mod && (e.key === "y" || (e.key === "z" && e.shiftKey))) { e.preventDefault(); redo(); return; }
     }
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // ── Main track node IDs (for Properties Panel badge) ──
@@ -1140,6 +1270,7 @@ export default function CaseCanvas({
   // ── Mutations ──
 
   function addMainTrackNode() {
+    checkpoint();
     const chain = getMainTrackChain(nodes, branches);
     const lastNode = chain[chain.length - 1];
     const newId = uid();
@@ -1166,6 +1297,7 @@ export default function CaseCanvas({
   }
 
   function addBranchNode(fromNodeId: string) {
+    checkpoint();
     const newId = uid();
     const newNode: CaseNode = {
       id: newId,
@@ -1201,6 +1333,7 @@ export default function CaseCanvas({
     }
     const duplicate = branches.some(b => b.fromNodeId === connectingFrom && b.toNodeId === toNodeId);
     if (!duplicate) {
+      checkpoint();
       const newBranch: CaseBranch = {
         id: uid(),
         fromNodeId: connectingFrom,
@@ -1216,6 +1349,7 @@ export default function CaseCanvas({
   }
 
   function deleteNode(id: string) {
+    checkpoint();
     const reachable = new Set<string>([id]);
     let frontier = [id];
     while (frontier.length > 0) {
@@ -1240,6 +1374,7 @@ export default function CaseCanvas({
   }
 
   function deleteBranch(id: string) {
+    checkpoint();
     setBranches(prev => prev.filter(b => b.id !== id));
     setSelection(null);
   }
@@ -1307,14 +1442,53 @@ export default function CaseCanvas({
           ))}
         </div>
 
-        {/* Canvas-only: Add step button */}
+        {/* Canvas-only controls */}
         {activeTab === "canvas" && (
-          <button
-            onClick={addMainTrackNode}
-            className="text-xs bg-brand-500 hover:bg-brand-600 text-white rounded-lg px-3 h-7 font-semibold transition-all shrink-0"
-          >
-            + Add step
-          </button>
+          <div className="flex items-center gap-1.5 shrink-0">
+            {/* Undo/Redo */}
+            <button
+              onClick={undo}
+              disabled={!canUndo}
+              title="Undo (⌘Z)"
+              className="w-7 h-7 flex items-center justify-center rounded-lg border border-border text-muted-foreground hover:text-foreground hover:bg-muted transition-all disabled:opacity-30 disabled:cursor-not-allowed"
+            >
+              <svg viewBox="0 0 16 16" className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round">
+                <path d="M2 6h7a4 4 0 010 8H5" /><path d="M2 3l3 3-3 3" transform="rotate(180,5,6)" />
+              </svg>
+            </button>
+            <button
+              onClick={redo}
+              disabled={!canRedo}
+              title="Redo (⌘⇧Z)"
+              className="w-7 h-7 flex items-center justify-center rounded-lg border border-border text-muted-foreground hover:text-foreground hover:bg-muted transition-all disabled:opacity-30 disabled:cursor-not-allowed"
+            >
+              <svg viewBox="0 0 16 16" className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round">
+                <path d="M14 6H7a4 4 0 000 8h4" /><path d="M14 3l-3 3 3 3" />
+              </svg>
+            </button>
+
+            {/* Hint toggle */}
+            <button
+              onClick={() => onChange({ ...tree, hintsEnabled: !tree.hintsEnabled, updatedAt: new Date().toISOString() })}
+              title={tree.hintsEnabled ? "Hints ON — students can request hints" : "Hints OFF — students must figure it out"}
+              className={cn(
+                "text-xs border rounded-lg px-2.5 h-7 font-semibold transition-all",
+                tree.hintsEnabled
+                  ? "border-amber-400 text-amber-700 bg-amber-50 dark:bg-amber-950/30 dark:text-amber-400"
+                  : "border-border text-muted-foreground hover:text-foreground"
+              )}
+            >
+              💡 {tree.hintsEnabled ? "Hints On" : "Hints Off"}
+            </button>
+
+            {/* Add step */}
+            <button
+              onClick={addMainTrackNode}
+              className="text-xs bg-brand-500 hover:bg-brand-600 text-white rounded-lg px-3 h-7 font-semibold transition-all"
+            >
+              + Add step
+            </button>
+          </div>
         )}
       </div>
 
@@ -1375,6 +1549,16 @@ export default function CaseCanvas({
                 connectingFrom={connectingFrom}
                 connectExistingNode={connectExistingNode}
                 onCancelConnect={() => setConnectingFrom(null)}
+                draggingNodeId={draggingNodeId}
+                dropTargetNodeId={dropTargetNodeId}
+                onDragStart={(id) => setDraggingNodeId(id)}
+                onDragOver={(id) => setDropTargetNodeId(id)}
+                onDrop={(draggedId, targetId) => {
+                  reorderMainTrack(draggedId, targetId);
+                  setDraggingNodeId(null);
+                  setDropTargetNodeId(null);
+                }}
+                onDragEnd={() => { setDraggingNodeId(null); setDropTargetNodeId(null); }}
               />
             </div>
           </div>

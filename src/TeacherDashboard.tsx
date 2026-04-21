@@ -925,37 +925,42 @@ export default function TeacherDashboard({ onBack, isDark, onToggleDark, onPrevi
         </div>
 
         <div className="ml-auto flex items-center gap-2">
-          {hasSyllabus && (
-            <span className="hidden sm:flex text-xs text-emerald-600 dark:text-emerald-400 font-medium items-center gap-1 bg-emerald-50 dark:bg-emerald-950/30 border border-emerald-200 dark:border-emerald-800 rounded-lg px-2.5 h-8">
-              <span>✓</span>
-              <span className="truncate max-w-[140px]">{syllabusFileName}</span>
-            </span>
+          {/* Upload Syllabus + Lock are only relevant on the Weeks tab */}
+          {teacherView !== "cases" && (
+            <>
+              {hasSyllabus && (
+                <span className="hidden sm:flex text-xs text-emerald-600 dark:text-emerald-400 font-medium items-center gap-1 bg-emerald-50 dark:bg-emerald-950/30 border border-emerald-200 dark:border-emerald-800 rounded-lg px-2.5 h-8">
+                  <span>✓</span>
+                  <span className="truncate max-w-[140px]">{syllabusFileName}</span>
+                </span>
+              )}
+              <button
+                onClick={() => syllabusInputRef.current?.click()}
+                disabled={syllabusLoading || locked}
+                className={cn(
+                  "text-xs border rounded-lg px-3 h-8 transition-all font-medium whitespace-nowrap",
+                  hasSyllabus
+                    ? "border-emerald-300 text-emerald-700 hover:bg-emerald-50 dark:hover:bg-emerald-950/30"
+                    : "border-brand-400 text-brand-600 hover:bg-brand-50 dark:hover:bg-brand-950/30"
+                )}
+              >
+                {syllabusLoading ? "Analyzing…" : hasSyllabus ? "↑ Re-upload Syllabus" : "↑ Upload Syllabus"}
+              </button>
+              <input ref={syllabusInputRef} type="file" accept=".txt,.md,.docx,.pdf,.pptx,.png,.jpg,.jpeg,.webp,.gif" className="hidden" onChange={handleSyllabusUpload} />
+              <button
+                onClick={() => setLocked((v) => !v)}
+                title={locked ? "Unlock editing" : "Lock — prevent accidental edits"}
+                className={cn(
+                  "text-xs border rounded-lg px-3 h-8 transition-all font-medium",
+                  locked
+                    ? "border-amber-300 text-amber-700 bg-amber-50"
+                    : "border-border text-muted-foreground hover:text-foreground"
+                )}
+              >
+                {locked ? "🔒 Locked" : "🔓 Editing"}
+              </button>
+            </>
           )}
-          <button
-            onClick={() => syllabusInputRef.current?.click()}
-            disabled={syllabusLoading || locked}
-            className={cn(
-              "text-xs border rounded-lg px-3 h-8 transition-all font-medium whitespace-nowrap",
-              hasSyllabus
-                ? "border-emerald-300 text-emerald-700 hover:bg-emerald-50 dark:hover:bg-emerald-950/30"
-                : "border-brand-400 text-brand-600 hover:bg-brand-50 dark:hover:bg-brand-950/30"
-            )}
-          >
-            {syllabusLoading ? "Analyzing…" : hasSyllabus ? "↑ Re-upload Syllabus" : "↑ Upload Syllabus"}
-          </button>
-          <input ref={syllabusInputRef} type="file" accept=".txt,.md,.docx,.pdf,.pptx,.png,.jpg,.jpeg,.webp,.gif" className="hidden" onChange={handleSyllabusUpload} />
-          <button
-            onClick={() => setLocked((v) => !v)}
-            title={locked ? "Unlock editing" : "Lock — prevent accidental edits"}
-            className={cn(
-              "text-xs border rounded-lg px-3 h-8 transition-all font-medium",
-              locked
-                ? "border-amber-300 text-amber-700 bg-amber-50"
-                : "border-border text-muted-foreground hover:text-foreground"
-            )}
-          >
-            {locked ? "🔒 Locked" : "🔓 Editing"}
-          </button>
           {onToggleDark && (
             <button
               onClick={onToggleDark}
@@ -1001,8 +1006,8 @@ export default function TeacherDashboard({ onBack, isDark, onToggleDark, onPrevi
       {/* ── Body: sidebar + content ── */}
       <div className="flex flex-1 overflow-hidden">
 
-        {/* ── Sidebar ── */}
-        <aside className="w-52 shrink-0 bg-card border-r border-border flex flex-col overflow-hidden shadow-sm">
+        {/* ── Sidebar — hidden when editing a specific case (canvas fills the screen) ── */}
+        {!editingCase && <aside className="w-52 shrink-0 bg-card border-r border-border flex flex-col overflow-hidden shadow-sm">
 
           {/* View toggle */}
           <div className="shrink-0 p-2 border-b border-border flex gap-1">
@@ -1145,18 +1150,13 @@ export default function TeacherDashboard({ onBack, isDark, onToggleDark, onPrevi
                   <div key={c.id} className="group relative rounded-lg">
                     <button
                       onClick={() => setEditingCase(c)}
-                      className={cn(
-                        "w-full text-left px-2.5 py-2 rounded-lg flex items-start gap-2 transition-all",
-                        editingCase?.id === c.id
-                          ? "bg-red-600 text-white shadow-sm"
-                          : "hover:bg-muted/60 text-foreground"
-                      )}
+                      className="w-full text-left px-2.5 py-2 rounded-lg flex items-start gap-2 transition-all hover:bg-muted/60 text-foreground"
                     >
                       <div className="flex-1 min-w-0">
-                        <p className={cn("text-xs font-semibold truncate", editingCase?.id === c.id ? "text-white" : "text-foreground")}>
+                        <p className="text-xs font-semibold truncate text-foreground">
                           {c.title || "Untitled Case"}
                         </p>
-                        <p className={cn("text-[10px] truncate", editingCase?.id === c.id ? "text-white/70" : "text-muted-foreground")}>
+                        <p className="text-[10px] truncate text-muted-foreground">
                           {c.nodes.length} node{c.nodes.length !== 1 ? "s" : ""}
                         </p>
                       </div>
@@ -1231,7 +1231,7 @@ export default function TeacherDashboard({ onBack, isDark, onToggleDark, onPrevi
               </>
             )}
           </div>
-        </aside>
+        </aside>}
 
         {/* ── Main content ── */}
         {/* Cases view: CaseCanvas (full height, no scroll wrapper) */}

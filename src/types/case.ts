@@ -144,6 +144,7 @@ export interface CaseTree {
   mediaFiles: CaseMediaFile[];
   docFiles: CaseDocFile[];
   patientProfile: PatientProfile;
+  hintsEnabled?: boolean; // Teacher toggle — allows student to request hints during simulation
   publishedToStudents: boolean;
   createdAt: string;
   updatedAt: string;
